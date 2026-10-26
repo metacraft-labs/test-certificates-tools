@@ -1,0 +1,166 @@
+name: CI
+
+# Runs on the product mainline and on pull requests into it (and into
+# `stable`), never on `agents`: work reaches `dev` through a promotion pull
+# request, whose checks are these.
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev, stable]
+  pull_request:
+    branches: [dev, stable]
+
+# Cancel superseded PR runs only; every other event gets a group unique to its
+# run, so it is never cancelled and never cancels anything.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Coverage: the three Nix legs (Linux x64, Linux arm64, macOS arm64). Windows
+# is a documented exception for now: the dev environment is the Nix flake, and
+# `put --system` is deliberately unsupported on Windows (see
+# docs/users/README.md); a Windows leg arrives with the release packaging.
+
+jobs:
+  choose-linux:
+    # Public repository: free GitHub-hosted runners unless CI_RUNNER_MODE says
+    # otherwise, with the self-hosted capability labels as the fallback.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
+  choose-macos:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
+  lint:
+    needs: choose-linux
+    name: Lint
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Dev Environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        with:
+          env-flavor: nix
+
+      - name: Run lint
+        # `shell: bash` selects `-eo pipefail`, without which `| tee` would
+        # report tee's status and hide a failing `just`.
+        shell: bash
+        run: dev-exec just lint 2>&1 | tee lint.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-logs
+          path: lint.log
+          retention-days: 7
+
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        with:
+          path: lint.log
+          prefix: lint-logs/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
+
+  test:
+    needs: [choose-linux, choose-macos]
+    name: Test (${{ matrix.slug }})
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
+          - slug: linux-arm64
+            runs-on: [self-hosted, linux, arm64]
+          - slug: macos-arm64
+            runs-on: [self-hosted, macos, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The conformance test reads the specification's vectors at the commit
+      # tests/spec-vectors.pin names, from git's object store, so the clone
+      # needs full history rather than a shallow tip.
+      - name: Checkout the specification (for its conformance vectors)
+        uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/test-certificates-spec
+          path: .ci/test-certificates-spec
+          fetch-depth: 0
+
+      - name: Setup Dev Environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        with:
+          env-flavor: nix
+
+      - name: Run tests
+        shell: bash
+        env:
+          TEST_CERTIFICATES_SPEC_DIR: ${{ github.workspace }}/.ci/test-certificates-spec
+        run: dev-exec just test 2>&1 | tee test.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.slug }}
+          path: test.log
+          retention-days: 7
+
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        with:
+          path: test.log
+          prefix: test-logs-${{ matrix.slug }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
+
+  nix-build:
+    needs: [choose-linux, choose-macos]
+    name: Nix build (${{ matrix.slug }})
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || fromJSON(needs.choose-linux.outputs.runs_on) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        slug: [linux-x64, macos-arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Dev Environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        with:
+          env-flavor: nix
+
+      - name: nix build
+        shell: bash
+        run: nix build --print-build-logs .#default 2>&1 | tee nix-build.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-build-logs-${{ matrix.slug }}
+          path: nix-build.log
+          retention-days: 7
