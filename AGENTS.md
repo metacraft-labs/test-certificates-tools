@@ -1,7 +1,8 @@
 # AGENTS.md
 
 Helper tooling for the test-certificate standard: the local certificate store
-(`store-root`, `put`, `find`, `prune`) as a Nim library (`test_certificates`)
+(`store-root`, `put`, `find`, `prune`) and its git-notes carrier (`notes
+publish`, `import`, `push`, `fetch`) as a Nim library (`test_certificates`)
 and the `test-certificates` command over it.
 
 ## Repository class and branches

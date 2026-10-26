@@ -16,10 +16,12 @@
 ## * ``find``: 0 candidates found, 1 none found, 2 the content id could not
 ##   be computed (Tooling §2) — a usage error is reported the same way, since
 ##   no id was looked up;
-## * every other command: 0 success, 1 an operation failed, 2 usage error.
+## * every other command, `notes` included: 0 success, 1 an operation
+##   failed, 2 usage error. A note piece that is reported and skipped (Transport
+##   §3.1) is not a failure.
 
 import std/[os, sequtils, strutils]
-import ./[roots, put, find, prune, content_state]
+import ./[roots, put, find, prune, content_state, notes]
 
 const
   Version* = block:
@@ -37,6 +39,9 @@ Usage:
   test-certificates find (--content <id> | --commit <rev> | --staged | --worktree)
                          [--paths <path>...] [--algorithm <algorithm>]
   test-certificates prune [--keep <n>] [--system <user>]
+  test-certificates notes publish <commit>|<range>...
+  test-certificates notes import [<commit>|<range>...]
+  test-certificates notes (push|fetch) <remote>
   test-certificates --help | --version
 
 Commands:
@@ -48,6 +53,15 @@ Commands:
               id, from both roots. Exit 0 found, 1 none, 2 uncomputable.
   prune       Remove content directories beyond the newest n (default 20),
               never the one for the current repository's HEAD^{tree}.
+  notes       Carry certificates in git notes on each commit's tree, in the
+              notes ref (git config testCertificates.notesRef, default
+              refs/notes/test-certificates/certificates):
+                publish  add the store's certificates to the local notes
+                import   copy noted certificates into the user root
+                         (default HEAD)
+                push     push the notes ref; on a race, fetch, merge the
+                         union of both sides and retry
+                fetch    fetch the remote notes ref and merge the union
 """
 
 type CliIo* = object
@@ -341,6 +355,95 @@ proc pruneCommand(io: CliIo, args: seq[string]): int =
   if r.ok and r.errors.len == 0: 0 else: 1
 
 # ---------------------------------------------------------------------------
+# notes
+# ---------------------------------------------------------------------------
+
+proc reportSync(io: CliIo, verb: string, r: SyncReport): int =
+  for remark in r.remarks:
+    io.errors.say "note: " & remark
+  for p in r.problems:
+    io.errors.say "test-certificates: " & p
+  if not r.ok:
+    return 1
+  var line = r.notesRef & ": " & $r.outcome
+  if verb == "push":
+    line.add " after " & $r.attempts & " attempt(s)"
+  if r.merges > 0:
+    line.add ", " & $r.merges & " union merge(s)"
+  io.errors.say line
+  if r.notesCommit.len > 0:
+    io.output.say r.notesCommit
+  0
+
+proc notesCommand(io: CliIo, args: seq[string]): int =
+  if args.len == 0:
+    return usageError(io, "notes needs a subcommand: publish, import, push or fetch")
+  let rest = args[1 ..^ 1]
+  for a in rest:
+    if a.startsWith("-"):
+      return usageError(io, "notes " & args[0] & ": unknown option " & a)
+  case args[0]
+  of "publish":
+    if rest.len == 0:
+      return usageError(io, "notes publish needs at least one commit or range")
+    let report = publishNotes(getCurrentDir(), nativeRoots(), rest)
+    for t in report.trees:
+      for p in t.searchProblems:
+        io.errors.say "note: " & p
+      for p in t.notPublished:
+        io.errors.say "note: not published: " & p
+      for h in t.appended:
+        io.output.say t.contentId & " " & h
+      for h in t.replaced:
+        io.output.say t.contentId & " " & h
+      io.errors.say t.contentId & " (" & t.commits.join(", ") & "): " & $t.appended.len &
+        " appended, " & $t.replaced.len & " replaced by a signed copy, " & $t.present.len &
+        " already present"
+    for remark in report.remarks:
+      io.errors.say "note: " & remark
+    for p in report.problems:
+      io.errors.say "test-certificates: " & p
+    if not report.ok:
+      return 1
+    if report.notesCommit.len > 0:
+      io.errors.say report.notesRef & " updated to " & report.notesCommit &
+        " (local only; `test-certificates notes push <remote>` publishes it)"
+    else:
+      io.errors.say report.notesRef & " unchanged"
+    0
+  of "import":
+    let roots = nativeRoots()
+    let report = importNotes(getCurrentDir(), roots.user, rest)
+    for t in report.trees:
+      for s in t.stored:
+        io.output.say s.path
+      for f in t.faults:
+        io.errors.say "note: " & t.contentId & ": " & f
+      if not t.hasNote:
+        io.errors.say t.contentId & " (" & t.commit & "): no note"
+      else:
+        var kept = 0
+        for s in t.stored:
+          if s.kept:
+            inc kept
+        io.errors.say t.contentId & " (" & t.commit & "): " & $t.stored.len &
+          " record(s) stored (" & $kept & " kept an existing file), " & $t.faults.len &
+          " skipped"
+    reportProblems(io, roots.problems)
+    for p in report.problems:
+      io.errors.say "test-certificates: " & p
+    if report.ok: 0 else: 1
+  of "push", "fetch":
+    if rest.len != 1:
+      return usageError(io, "notes " & args[0] & " needs exactly one remote")
+    if args[0] == "push":
+      reportSync(io, "push", pushNotes(getCurrentDir(), rest[0]))
+    else:
+      reportSync(io, "fetch", fetchNotes(getCurrentDir(), rest[0]))
+  else:
+    usageError(io, "unknown notes subcommand " & args[0])
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -360,6 +463,8 @@ proc runCli*(args: openArray[string], io: CliIo): int =
       findCommand(io, rest)
     of "prune":
       pruneCommand(io, rest)
+    of "notes":
+      notesCommand(io, rest)
     of "--help", "-h", "help":
       io.output.write Usage
       0

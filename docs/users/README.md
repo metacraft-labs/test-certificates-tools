@@ -3,8 +3,8 @@
 `test-certificates` implements the local certificate store of the
 test-certificate standard
 ([Transport §2](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Transport.md#2-the-local-certificate-store-required))
-as specified for the reference tooling
-([Tooling §2, §5](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Tooling.md)).
+and its git-notes carrier (Transport §3), as specified for the reference
+tooling ([Tooling §2, §3, §5](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Tooling.md)).
 Every command is a thin wrapper over a library call of the same name; both
 are described here.
 
@@ -143,6 +143,82 @@ count as content. Prints each removed directory. Exit 0, or 1 when something
 could not be removed (reported), 2 on a usage error.
 
 Library: `pruneRoot(root, keep, protectedIds, system = false): PruneResult`.
+
+### `notes`
+
+```
+test-certificates notes publish <commit>|<range>...
+test-certificates notes import [<commit>|<range>...]
+test-certificates notes push <remote>
+test-certificates notes fetch <remote>
+```
+
+The store does not leave the machine. These commands carry certificates in a
+git notes ref, attached to the **tree** each commit's content id names
+([Transport §3](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Transport.md#3-git-notes-recommended-for-pushing)),
+so they travel with a push to a receiving-side gate, a reviewer or CI.
+
+The ref is `refs/notes/test-certificates/certificates`, or what
+`git config testCertificates.notesRef <ref>` sets for the repository. It must
+be a valid ref name under `refs/notes/`; anything else is refused.
+
+Every note holds its records in the framing of
+[Transport §3.1](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Transport.md#31-multiple-records-in-one-note):
+each record in canonical form (its canonical payload, then, when signed, a
+blank line and the signature table), preceded by the line
+`# --- test-certificate ---`.
+
+**`notes publish`** adds the store's certificates (both roots) for each
+commit's `<commit>^{tree}` to the note on that tree, in the **local** ref
+only. A revision containing `..` or `^-`, or ending in `^!` or `^@`, is a range; any
+other names one commit. Publishing is idempotent: a record is identified by
+its payload hash, and a payload already in the note is not added again. A
+signed copy replaces an unsigned record of the same payload in place; an
+unsigned copy never replaces anything. Everything else in the note — other
+frameworks' records, records this tool cannot parse, text before the first
+delimiter — is kept byte for byte. A store file that does not parse is
+reported and not published. Standard output lists `<content-id>
+<payload-hash>` for every record added or replaced.
+
+**`notes import`** copies the records in the notes on each commit's tree
+(default `HEAD`) into the user root, as `put` would. Text before the first
+delimiter, a piece that does not parse, and a record whose `content` names
+another tree (misattached) are reported on standard error and skipped; the
+other records are still imported. Standard output lists the stored paths.
+
+**`notes push`** pushes the local ref without force. When the remote ref has
+moved, it fetches it, merges the **union** of both sides' records into the
+local ref, and tries again — five attempts in all, with backoff. **`notes
+fetch`** fetches the remote ref and merges it into the local one the same
+way. The merge never lets one side win: for every annotated tree, the result
+holds every record of both sides, each payload once (a signed copy replaces
+an unsigned one; of two differently signed copies, the remote's is kept), and
+every piece neither side can parse. When one side already contains the other
+the ref just moves forward. A merge is an ordinary two-parent commit, so
+`git log <ref>` shows both histories. Both print the resulting ref value on
+standard output.
+
+Notes are not pushed or fetched by git by default; these commands are how
+they move. Neither ever prompts for credentials: a remote that needs them
+and cannot get them fails, and says so. `notes push` runs the repository's
+`pre-push` hook like any push (a caller that is itself a `pre-push` hook
+turns that off through the library, `PushOptions.runHooks`, so it does not
+re-enter the hook).
+
+`publish`, `push` and `fetch` make commits on the notes ref. They are made
+with git's configured identity. Where git has none — a CI container, say —
+they are made as `test-certificates <test-certificates@localhost>` and a
+`note:` line on standard error says so. A notes commit's author carries no
+weight: what a certificate is worth is its signature (Transport §3).
+
+Exit 0 on success, 1 when an operation failed (reported), 2 on a usage
+error. A note piece that is reported and skipped is not a failure.
+
+Library: `publishNotes(dir, roots, revisions): PublishReport`,
+`importNotes(dir, userRoot, revisions): ImportReport`,
+`pushNotes(dir, remote): SyncReport`, `fetchNotes(dir, remote): SyncReport`;
+the framing itself is `splitNote`, `renderNote`, `addRecord` and
+`mergeNotes`.
 
 ## Environment
 

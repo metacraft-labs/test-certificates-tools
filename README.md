@@ -1,8 +1,8 @@
 # test-certificates-tools
 
 Helper tooling for the [test-certificate standard](https://github.com/metacraft-labs/test-certificates-spec):
-the local certificate store, as a Nim library and the `test-certificates`
-command.
+the local certificate store and its git-notes carrier, as a Nim library and
+the `test-certificates` command.
 
 **Documentation:** [docs/users/](./docs/users/README.md) · the standard's
 [Transport §2](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Transport.md#2-the-local-certificate-store-required)
@@ -25,6 +25,9 @@ package is that plumbing, done once:
   committed, the working tree, or an explicit content id, from both roots,
   reporting what it searched.
 - **`prune`** — bound the store without ever racing a writer.
+- **`notes publish` / `import` / `push` / `fetch`** — carry certificates
+  with a push in a git notes ref keyed by tree, and merge concurrent pushes
+  as a union so no one's certificates are lost.
 
 It does **not** verify, issue or sign certificates. `find` returns candidates;
 a framework's verifier judges them.
@@ -68,6 +71,10 @@ $ test-certificates find --commit HEAD
 $ test-certificates find --content git-tree-sha1:9f8e7d6c5b4a3928170695e4d3c2b1a099887766
 
 $ test-certificates prune --keep 20
+
+$ test-certificates notes publish origin/main..HEAD   # store -> local notes ref
+$ test-certificates notes push origin                  # union-merges on a race
+$ test-certificates notes fetch origin && test-certificates notes import
 ```
 
 `find` prints candidate paths on standard output and what it searched on

@@ -10,6 +10,10 @@
 ## ``put <file>…``               ``putFile`` / ``putCertificate``
 ## ``find <state>``              ``find`` / ``findById``
 ## ``prune``                     ``pruneRoot``
+## ``notes publish <commit>…``   ``publishNotes``
+## ``notes import [<commit>…]``  ``importNotes``
+## ``notes push <remote>``       ``pushNotes``
+## ``notes fetch <remote>``      ``fetchNotes``
 ## ============================  ==============================================
 ##
 ## Errors are returned in the result objects, never raised to the caller and
@@ -17,16 +21,16 @@
 ##
 ## The library implements the local certificate store of the test-certificate
 ## standard (Transport §2), the content-id computations a ``find`` needs
-## (Content-Id §4, §5), and the note framing of the git-notes carrier
-## (Transport §3.1, ``note_framing``). It does not verify, issue or sign
-## certificates.
+## (Content-Id §4, §5), and the git-notes carrier (Transport §3, with the
+## note framing of §3.1 in ``note_framing``). It does not verify, issue or
+## sign certificates.
 
 import
   test_certificates/[
     sha256, toml, content_id, certificate, content_state, roots, put, find, prune,
-    layout, note_framing,
+    layout, note_framing, notes,
   ]
 
 export
   sha256, toml, content_id, certificate, content_state, roots, put, find, prune, layout,
-  note_framing
+  note_framing, notes
