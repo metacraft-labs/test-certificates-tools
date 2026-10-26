@@ -16,14 +16,17 @@
 ## never fatal, and nothing here logs: reporting is the caller's.
 ##
 ## The library implements the local certificate store of the test-certificate
-## standard (Transport §2) and the content-id computations a ``find`` needs
-## (Content-Id §4, §5). It does not verify, issue or sign certificates.
+## standard (Transport §2), the content-id computations a ``find`` needs
+## (Content-Id §4, §5), and the note framing of the git-notes carrier
+## (Transport §3.1, ``note_framing``). It does not verify, issue or sign
+## certificates.
 
 import
   test_certificates/[
     sha256, toml, content_id, certificate, content_state, roots, put, find, prune,
-    layout,
+    layout, note_framing,
   ]
 
 export
-  sha256, toml, content_id, certificate, content_state, roots, put, find, prune, layout
+  sha256, toml, content_id, certificate, content_state, roots, put, find, prune, layout,
+  note_framing

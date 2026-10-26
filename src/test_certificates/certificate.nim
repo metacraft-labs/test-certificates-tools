@@ -184,6 +184,23 @@ proc canonicalPayload*(c: Certificate): PayloadResult =
     return PayloadResult(problem: problem)
   PayloadResult(ok: true, payload: lines.join("\n") & "\n")
 
+proc canonicalRecord*(c: Certificate): PayloadResult =
+  ## The record form a git note carries (Transport §3.1): the canonical
+  ## payload, followed, when signed, by one blank line and the
+  ## ``[certificate.signature]`` table with ``algorithm`` and ``value`` in
+  ## that order, in the payload's formatting rules. An unsigned record,
+  ## including one with the emptied block (Canonical-Payload §6), is its
+  ## payload alone.
+  result = canonicalPayload(c)
+  if not result.ok or not c.isSigned:
+    return
+  var problem = ""
+  result.payload.add "\n[certificate.signature]\n"
+  result.payload.add "algorithm = " & escapeValue(c.signatureAlgorithm, problem) & "\n"
+  result.payload.add "value = " & escapeValue(c.signatureValue, problem) & "\n"
+  if problem.len > 0:
+    return PayloadResult(problem: problem)
+
 # ---------------------------------------------------------------------------
 # Reading a record
 # ---------------------------------------------------------------------------

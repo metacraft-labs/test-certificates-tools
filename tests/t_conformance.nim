@@ -1,7 +1,7 @@
-## store_path_and_content_id_conformance_vectors
+## store_path_and_content_id_conformance_vectors, notes_framing_vectors
 ##
-## The specification's ``store/``, ``content/`` and ``payload/`` vector groups
-## (Conformance §1, §3, §5), read from the specification repository's object
+## The specification's ``store/``, ``content/``, ``payload/`` and ``notes/``
+## vector groups (Conformance §1, §3, §5), read from the specification repository's object
 ## store at the commit ``tests/spec-vectors.pin`` names, never from whatever
 ## revision its checkout happens to be on.
 ##
@@ -16,13 +16,16 @@
 ##   computed both natively from the entries and through the git route.
 ## * ``payload/``: ``fields.json`` serialized, and any ``received.toml``
 ##   parsed and re-serialized, byte-compared with ``canonical.txt``.
+## * ``notes/``: ``note.txt`` split per Transport §3.1 and every piece
+##   compared with ``expected.json``; for a writer case ``add.txt`` added and
+##   the blob byte-compared with ``expected-note.txt`` (notes_framing_vectors).
 ##
 ## Negative controls prove the walk is real: the number of cases walked must
 ## equal ``index.json``'s listing, and a corrupted copy of one expected value
 ## per group must be reported by the same checker. A pin the repository does
 ## not contain, and a malformed pin file, must be refused. No mocks.
 
-import std/[base64, json, tables, unittest, algorithm]
+import std/[base64, json, sequtils, tables, unittest, algorithm]
 import ./helpers
 import test_certificates
 
@@ -205,6 +208,56 @@ proc checkPayloadGroup(vectors: string): seq[string] =
         result.add name & ": received.toml re-serialized differently"
 
 # ---------------------------------------------------------------------------
+# notes/
+# ---------------------------------------------------------------------------
+
+proc checkNotesGroup(vectors: string): seq[string] =
+  ## vectors/README.md, "Group 6": split ``note.txt``, compare every piece
+  ## with ``expected.json``; for a writer case, add ``add.txt`` and compare
+  ## with ``expected-note.txt`` byte for byte. Signatures are not verified:
+  ## this package does not verify (Tooling §1), and ``signed`` is compared as
+  ## the presence of a signature block.
+  for dir in caseDirs(vectors, "notes"):
+    let name = dir.extractFilename
+    let note = readFile(dir / "note.txt")
+    let pieces = splitNote(note)
+    if renderNote(pieces) != note:
+      result.add name & ": splitting and re-rendering note.txt changed its bytes"
+    let expected = parseJson(readFile(dir / "expected.json"))["pieces"]
+    if expected.len != pieces.len:
+      result.add name & ": " & $pieces.len & " pieces, expected " & $expected.len
+      continue
+    for i, want in expected.getElems:
+      let got = pieces[i]
+      if want{"skipped"}.getBool(false):
+        if got.kind == pkRecord:
+          result.add name & ": piece " & $i & " was read as a record; expected skipped"
+        continue
+      if got.kind != pkRecord:
+        result.add name & ": piece " & $i & " was skipped (" & got.problem &
+          "); expected a record"
+        continue
+      let payload = canonicalPayload(got.certificate)
+      if not payload.ok or payload.payload != want["payload"].getStr:
+        result.add name & ": piece " & $i & "'s rebuilt payload differs"
+      if got.signed != want["signed"].getBool:
+        result.add name & ": piece " & $i & " signed=" & $got.signed & ", expected " &
+          $want["signed"].getBool
+    if fileExists(dir / "add.txt"):
+      let add = readFile(dir / "add.txt")
+      let record = recordPiece(add)
+      if record.kind != pkRecord:
+        result.add name & ": add.txt does not parse: " & record.problem
+        continue
+      # The writer's own rendering of the record is add.txt's form exactly.
+      if canonicalRecord(record.certificate).payload != add:
+        result.add name & ": canonicalRecord renders add.txt differently"
+      var written = pieces
+      discard addRecord(written, record)
+      if renderNote(written) != readFile(dir / "expected-note.txt"):
+        result.add name & ": adding add.txt did not produce expected-note.txt"
+
+# ---------------------------------------------------------------------------
 
 suite "conformance vectors":
   test "store_path_and_content_id_conformance_vectors":
@@ -243,6 +296,25 @@ suite "conformance vectors":
       checkpoint f
     check payloadFailures.len == 0
 
+  test "notes_framing_vectors":
+    let vectors = pinnedVectors()
+    defer:
+      cleanup(vectors.parentDir)
+    var names: seq[string]
+    for d in caseDirs(vectors, "notes"):
+      names.add d.extractFilename
+    check names == indexed(vectors, "notes")
+    let notesFailures = checkNotesGroup(vectors)
+    for f in notesFailures:
+      checkpoint f
+    check notesFailures.len == 0
+    for required in [
+      "appended", "corrupt-middle", "duplicate-not-added", "escaped-newline",
+      "foreign-preamble", "signed-and-unsigned", "signed-replaces-unsigned",
+      "single-unsigned", "unsigned-copy-not-added",
+    ]:
+      check dirExists(vectors / "notes" / required)
+
   test "negative controls: a corrupted vector is reported by the same checkers":
     let vectors = pinnedVectors()
     defer:
@@ -266,6 +338,22 @@ suite "conformance vectors":
     let canonicalFile = vectors / "payload" / "minimal" / "canonical.txt"
     writeFile(canonicalFile, readFile(canonicalFile).replace("passed", "failed"))
     check checkPayloadGroup(vectors).len == 1
+    # notes/: a reader expectation (a skipped piece claimed to be a record),
+    # and one byte of a writer's expected note.
+    let piecesFile = vectors / "notes" / "foreign-preamble" / "expected.json"
+    let pieces = parseJson(readFile(piecesFile))
+    pieces["pieces"].elems[0] = %*{"payload": "x", "signed": false}
+    writeFile(piecesFile, $pieces)
+    let expectedNote = vectors / "notes" / "appended" / "expected-note.txt"
+    writeFile(
+      expectedNote, readFile(expectedNote).replace("t-unit\"]\n", "t-unit\"] \n")
+    )
+    let notesFailures = checkNotesGroup(vectors)
+    for f in notesFailures:
+      checkpoint f
+    check notesFailures.len == 2
+    check notesFailures.anyIt(it.startsWith("foreign-preamble:"))
+    check notesFailures.anyIt(it.startsWith("appended:"))
 
   test "negative controls: the pin is honoured":
     let spec = specCheckout()
