@@ -38,7 +38,7 @@ proc toNative*(relative: string): string =
 
 var nameCounter: Atomic[int]
 
-proc uniqueSuffix(): string =
+proc uniqueSuffix*(): string =
   ## Unique across processes (pid) and calls within one (counter), and across
   ## a pid being reused after a crash (the clock).
   let now = getTime()

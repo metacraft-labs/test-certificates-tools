@@ -186,20 +186,49 @@ const PathspecEnvironment* = [
   # index they read (refreshing stat data). Nothing here may write the
   # user's index, so no optional write is wanted anywhere.
   ("GIT_OPTIONAL_LOCKS", "0"),
+  # A library call must never stop to ask for credentials on a terminal:
+  # `notes push` and `notes fetch` talk to remotes, and a hook or a CI job
+  # has nobody to answer. A remote that needs credentials it cannot get
+  # fails, and the failure is reported.
+  ("GIT_TERMINAL_PROMPT", "0"),
 ]
 
-proc git*(cwd: string, args: openArray[string], indexFile = "", input = ""): GitStep =
-  ## Run ``git <args>`` in ``cwd``. With ``indexFile``, git reads and writes
-  ## that index instead of the repository's, with the split index and the
-  ## filesystem monitor off for the command (both would otherwise make git
-  ## write outside, or trust state from outside, the temporary index).
-  var env = @PathspecEnvironment
+proc gitRun*(
+    cwd: string,
+    args: openArray[string],
+    indexFile = "",
+    input = "",
+    env: openArray[(string, string)] = [],
+): GitRun =
+  ## Run ``git <args>`` in ``cwd`` and answer everything it did: its exit
+  ## status, stdout and stderr, apart. For the callers that must tell one
+  ## failure from another (``push --porcelain`` reports a rejected ref on
+  ## stdout with a non-zero status); every other caller uses ``git``.
+  ## ``env`` is added to the fixed environment above, and may override it.
+  ##
+  ## With ``indexFile``, git reads and writes that index instead of the
+  ## repository's, with the split index and the filesystem monitor off for
+  ## the command (both would otherwise make git write outside, or trust state
+  ## from outside, the temporary index).
+  var environment = @PathspecEnvironment
   var argv: seq[string]
   if indexFile.len > 0:
-    env.add ("GIT_INDEX_FILE", indexFile)
+    environment.add ("GIT_INDEX_FILE", indexFile)
     argv.add ["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"]
+  environment.add env
   argv.add args
-  let run = runProcess("git", argv, cwd, env, input)
+  runProcess("git", argv, cwd, environment, input)
+
+proc git*(
+    cwd: string,
+    args: openArray[string],
+    indexFile = "",
+    input = "",
+    env: openArray[(string, string)] = [],
+): GitStep =
+  ## Run ``git <args>`` in ``cwd`` (see ``gitRun``): success with its
+  ## stdout, or a sentence naming the command, its status and its stderr.
+  let run = gitRun(cwd, args, indexFile, input, env)
   let shown = "`git " & args.join(" ") & "`"
   if not run.started:
     return GitStep(failure: "could not run " & shown & ": " & run.failure)
