@@ -4,6 +4,12 @@
 ## * find_unions_user_and_system_roots
 ## * find_staged_and_worktree_compute_the_content_id_without_touching_the_index
 ## * find_reports_none_found_apart_from_uncomputable
+## * find_distinguishes_completed_empty_searches_and_unresolved_roots
+## * find_distinguishes_unreadable_roots_from_empty_searches
+##
+## Permission cases remove read access on each root and its content directory,
+## restore it before asserting, and require a non-root POSIX user. Both root
+## orders run against the real built binary; neither root may hide the other.
 ##
 ## Expected content ids are derived independently of the code under test
 ## wherever that is possible: with ordinary porcelain in a COPY of the
@@ -310,7 +316,7 @@ suite "find":
     run = runCliProcess(["find", "--commit", "no-such-revision"], env, cwd = repo)
     check run.exitCode == 2
     run = runCliProcess(["find", "--commit", "--all"], env, cwd = repo)
-    check run.exitCode == 2
+    check run.exitCode == 64
     run = runCliProcess(
       ["find", "--worktree", "--algorithm", "git-tree-sha256"], env, cwd = repo
     )
@@ -359,12 +365,86 @@ suite "find":
       check run.exitCode == 2
       check "unmerged entries: f" in run.errors
 
-    # Usage errors are not lookups either.
+    # Usage errors have their own status and precede content-id computation.
     for args in [
       newSeq[string](),
       @["--staged", "--worktree"],
       @["--content", content, "--paths", "x"],
       @["--bogus"],
+      @["--content"],
+      @["--commit"],
+      @["--worktree", "--algorithm"],
+      @["--worktree", "--paths"],
+      @["--content", content, "--paths"],
+      @["--content", content, "--algorithm", "md5"],
+      @["--content", "nocolon", "--bogus"],
+      @["--worktree", "--algorithm", "md5", "--bogus"],
     ]:
       run = runCliProcess(@["find"] & args, env, cwd = repo)
-      check run.exitCode == 2
+      check run.exitCode == 64
+      check run.output == ""
+      check "for usage" in run.errors
+      check "searched" notin run.errors
+      check "content id:" notin run.errors
+
+  test "find_distinguishes_completed_empty_searches_and_unresolved_roots":
+    let dir = scratchDir()
+    defer:
+      cleanup(dir)
+    let user = dir / "user"
+    let partition = dir / "system" / myAccount()
+    let env = storeEnv(user, dir / "system")
+    let content = "git-tree-sha1:" & repeat('5', 40)
+    # Absent roots, empty roots, and empty content directories are all a
+    # complete empty lookup. None is an unreadable store.
+    for root in [user, partition]:
+      let run = runCliProcess(["find", "--content", content], env)
+      check run.exitCode == 1
+      createDir(root)
+    for root in [user, partition]:
+      createDir(root / "v1" / "git-tree-sha1" / repeat('5', 40))
+    var run = runCliProcess(["find", "--content", content], env)
+    check run.exitCode == 1
+    check run.errors.count("[listed]") == 2
+    # An unresolved root makes discovery incomplete on every platform.
+    check $findById(StoreRoots(user: user), content).outcome == "foIncomplete"
+
+  when not defined(windows):
+    test "find_distinguishes_unreadable_roots_from_empty_searches":
+      if geteuid() == 0:
+        fatal "this test must not run as root: root reads a mode-000 directory"
+      let dir = scratchDir()
+      defer:
+        cleanup(dir)
+      let user = dir / "user"
+      let partition = dir / "system" / myAccount()
+      let env = storeEnv(user, dir / "system")
+      let content = "git-tree-sha1:" & repeat('5', 40)
+      let roots = StoreRoots(user: user, system: partition)
+      for root in [user, partition]:
+        createDir(root / "v1" / "git-tree-sha1" / repeat('5', 40))
+      # Either root may be unreadable, at the root itself or below it. A
+      # candidate from its peer wins; after removing it, emptiness is unknown.
+      for (blocked, peer) in [(user, partition), (partition, user)]:
+        for denied in [
+          blocked, blocked / "v1", blocked / "v1" / "git-tree-sha1" / repeat('5', 40)
+        ]:
+          let candidate = putAt(peer, certificateText(content))
+          setFilePermissions(denied, {})
+          let found = runCliProcess(["find", "--content", content], env)
+          removeFile(candidate)
+          let empty = runCliProcess(["find", "--content", content], env)
+          let report = findById(roots, content)
+          setFilePermissions(denied, {fpUserRead, fpUserWrite, fpUserExec})
+          checkpoint denied
+          check found.exitCode == 0
+          check found.output == candidate & "\n"
+          check "[unreadable]" in found.errors
+          check empty.exitCode == 3
+          check empty.output == ""
+          check empty.errors.count("searched ") == 2
+          check "[unreadable]" in empty.errors
+          check "search incomplete" in empty.errors
+          # Check the library's classification without coupling to an enum
+          # introduced by the fix, so this test runs against the old source.
+          check $report.outcome == "foIncomplete"

@@ -78,8 +78,11 @@ $ test-certificates notes fetch origin && test-certificates notes import
 ```
 
 `find` prints candidate paths on standard output and what it searched on
-standard error, and exits 0 when candidates exist, 1 when none were found,
-and 2 when the content id could not be computed.
+standard error. It exits 0 when candidates exist, 1 for a completed empty
+search, 2 when the content id could not be computed, 3 when no candidates
+were found and a root could not be read or resolved, and 64 for a usage error.
+An unreadable root is reported even when a candidate in the other root
+makes the command succeed.
 
 From Nim:
 

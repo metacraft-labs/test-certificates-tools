@@ -63,8 +63,9 @@ type
 
   FindOutcome* = enum
     foFound ## At least one candidate (exit 0).
-    foNone ## None found (exit 1).
+    foNone ## None found in a completed search (exit 1).
     foUncomputable ## The content id could not be computed (exit 2).
+    foIncomplete ## None found, but a root could not be read or resolved (exit 3).
 
 proc outcome*(r: FindReport): FindOutcome =
   if r.contentId.len == 0:
@@ -72,6 +73,11 @@ proc outcome*(r: FindReport): FindOutcome =
   elif r.candidates.len > 0:
     foFound
   else:
+    # A candidate is useful even if its peer root was inaccessible. With none,
+    # distinguish absence from a search that could not cover both roots.
+    for search in r.searches:
+      if search.status in {rsUnreadable, rsUnresolved}:
+        return foIncomplete
     foNone
 
 proc accessState(path: string): tuple[exists, denied: bool, problem: string] =

@@ -117,14 +117,21 @@ A file that does not parse is still returned, with a note: whether it counts
 is your verifier's decision. An unreadable root is reported and the other
 root still searched.
 
-| Exit | Meaning                                                                                                                                                                                                                                                                                                                                        |
-| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0    | candidates found                                                                                                                                                                                                                                                                                                                               |
-| 1    | none found                                                                                                                                                                                                                                                                                                                                     |
-| 2    | the content id could not be computed — not a git repository, an unknown revision, an algorithm this repository cannot compute (`git-tree-sha256` in a SHA-1 repository), a malformed `--content`, a state with no content id (unmerged entries, `assume-unchanged` or present `skip-worktree` entries, a modified submodule), or a usage error |
+| Exit | Meaning                                                                                                                                                                                                                                                                                                                     |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | Candidates found, even if the other root could not be read or resolved (still reported).                                                                                                                                                                                                                                    |
+| 1    | No candidates found; both roots searched without root resolution or directory reading failures. Missing roots and missing or empty content directories count as completed empty searches.                                                                                                                                   |
+| 2    | The content id could not be computed: not a git repository, an unknown revision or algorithm, an algorithm this repository cannot compute, a malformed `--content`, or a state with no content id (unmerged entries, `assume-unchanged`, present `skip-worktree` entries, a modified submodule). Neither root was searched. |
+| 3    | No candidates found and a root could not be read or resolved, including unreadable intermediate or content directories. Discovery was incomplete.                                                                                                                                                                           |
+| 64   | Usage error: missing or multiple state flags, unknown arguments, missing option operands (including empty `--paths`), or `--paths` / `--algorithm` with `--content`.                                                                                                                                                        |
+
+Syntax is checked first, before computing an id or searching. After an id is
+obtained, candidates take precedence over an unreadable or unresolved root;
+otherwise an incomplete search takes precedence over absence.
 
 Library: `find(roots, FindQuery): FindReport` and `findById(roots, id)`;
-`computeContentId(repository, state, [algorithm,] scope)` computes an id on
+the report's `outcome` distinguishes `foFound`, `foNone`, `foUncomputable`
+and `foIncomplete`. `computeContentId(repository, state, [algorithm,] scope)` computes an id on
 its own.
 
 ### `prune`

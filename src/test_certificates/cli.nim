@@ -13,9 +13,9 @@
 ##
 ## Exit statuses:
 ##
-## * ``find``: 0 candidates found, 1 none found, 2 the content id could not
-##   be computed (Tooling §2) — a usage error is reported the same way, since
-##   no id was looked up;
+## * ``find``: 0 candidates found, 1 a completed empty search, 2 the content
+##   id could not be computed, 3 an incomplete empty search (a root could not
+##   be read or resolved), 64 usage error (Tooling §2);
 ## * every other command, `notes` included: 0 success, 1 an operation
 ##   failed, 2 usage error. A note piece that is reported and skipped (Transport
 ##   §3.1) is not a failure.
@@ -50,7 +50,8 @@ Commands:
               --system <user> (a uid, or a SID on Windows) into that user's
               system partition. `-` reads one certificate from standard input.
   find        Print the candidate certificates stored for a state's content
-              id, from both roots. Exit 0 found, 1 none, 2 uncomputable.
+              id, from both roots. Exit 0 found, 1 complete empty search,
+              2 uncomputable id, 3 incomplete empty search, 64 usage error.
   prune       Remove content directories beyond the newest n (default 20),
               never the one for the current repository's HEAD^{tree}.
   notes       Carry certificates in git notes on each commit's tree, in the
@@ -74,10 +75,10 @@ type CliIo* = object
 proc say(f: File, line: string) =
   f.writeLine(line)
 
-proc usageError(io: CliIo, msg: string): int =
+proc usageError(io: CliIo, msg: string, status = 2): int =
   io.errors.say "test-certificates: " & msg
   io.errors.say "Run `test-certificates --help` for usage."
-  2
+  status
 
 proc reportProblems(io: CliIo, problems: openArray[string]) =
   for p in problems:
@@ -202,13 +203,13 @@ proc findCommand(io: CliIo, args: seq[string]): int =
     of "--content":
       let v = value(a)
       if v.len == 0:
-        return usageError(io, "--content needs a content id")
+        return usageError(io, "--content needs a content id", 64)
       query = FindQuery(byContent: true, contentId: v)
       inc stateGiven
     of "--commit":
       let v = value(a)
       if v.len == 0:
-        return usageError(io, "--commit needs a revision")
+        return usageError(io, "--commit needs a revision", 64)
       query = FindQuery(byContent: false, state: commitState(v))
       inc stateGiven
     of "--staged":
@@ -220,10 +221,11 @@ proc findCommand(io: CliIo, args: seq[string]): int =
     of "--algorithm":
       algorithm = value(a)
       if algorithm.len == 0:
-        return usageError(io, "--algorithm needs an algorithm")
+        return usageError(io, "--algorithm needs an algorithm", 64)
     of "--paths":
       # `--paths a b c`: every following argument up to the next option.
       # A path that itself begins with `--` is passed after `--`.
+      let before = paths.len
       inc i
       while i < args.len and not args[i].startsWith("--"):
         paths.add args[i]
@@ -233,19 +235,22 @@ proc findCommand(io: CliIo, args: seq[string]): int =
         while i < args.len:
           paths.add args[i]
           inc i
+      if paths.len == before:
+        return usageError(io, "--paths needs at least one path", 64)
       continue
     else:
-      return usageError(io, "find: unknown argument " & a)
+      return usageError(io, "find: unknown argument " & a, 64)
     inc i
   if stateGiven != 1:
     return usageError(
-      io, "find needs exactly one of --content, --commit, --staged, --worktree"
+      io, "find needs exactly one of --content, --commit, --staged, --worktree", 64
     )
   if query.byContent and (paths.len > 0 or algorithm.len > 0):
     return usageError(
       io,
       "--paths and --algorithm do not apply to --content: the id already " &
         "names its algorithm and scope",
+      64,
     )
   if not query.byContent:
     query.repository = getCurrentDir()
@@ -282,6 +287,9 @@ proc findCommand(io: CliIo, args: seq[string]): int =
   of foNone:
     io.errors.say "no certificates found"
     1
+  of foIncomplete:
+    io.errors.say "no certificates found; search incomplete (a root could not be read or resolved)"
+    3
   of foUncomputable:
     io.errors.say "the content id could not be computed; nothing was looked up"
     2
