@@ -143,6 +143,7 @@
               pkgs.nimble
               pkgs.nph
               pkgs.git
+              pkgs.openssh
               pkgs.coreutils
               pkgs.nixfmt
             ]

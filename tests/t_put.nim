@@ -22,6 +22,8 @@ import test_certificates
 when not defined(windows):
   import std/posix except Time
 
+  proc flock(fd, operation: cint): cint {.importc, header: "<sys/file.h>".}
+
 const ContentX = "git-tree-sha1:1111111111111111111111111111111111111111"
 
 proc spawnPut(files: seq[string], env: seq[(string, string)]): Process =
@@ -120,6 +122,40 @@ suite "put":
     check names.len == 9
     check readFile(contentDir / relativeOf(signedX).extractFilename) == signedX
 
+  test "a relay waits for a concurrent signer before inspecting an unsigned copy":
+    when not defined(windows):
+      let dir = scratchDir()
+      defer:
+        cleanup(dir)
+      let vectors = pinnedVectors()
+      defer:
+        cleanup(vectors.parentDir)
+      let good = readFile(vectors / "store" / "signed" / "certificate.toml")
+      let unsigned = good.split("\n[certificate.signature]")[0] & "\n"
+      let bad = good.replace("value = \"", "value = \"AAAA")
+      let first = putCertificate(dir, unsigned)
+      check first.ok
+      # Act as another conforming signer, holding the same persistent lock
+      # and replacing its unsigned copy while the relay is waiting.
+      let fd = posix.open((dir / ".write-lock").cstring, O_RDWR or O_CREAT, Mode(0o600))
+      require fd >= 0
+      require flock(fd, 2) == 0
+      defer:
+        discard posix.close(fd)
+      let input = dir / "incoming"
+      writeFile(input, bad)
+      let child = spawnPut(@[input], storeEnv(dir))
+      defer:
+        child.close()
+      sleep(100)
+      check child.running # The unfixed relay completes without honoring the lock.
+      let temporary = dir / "signer-temporary"
+      writeFile(temporary, good)
+      moveFile(temporary, first.path)
+      check flock(fd, 8) == 0 # LOCK_UN
+      check child.waitForExit() == 0
+      check readFile(first.path) == good
+
   test "negative control: the same reader catches a writer that is not atomic":
     # Without this, the test above could pass because its reader never
     # managed to look at a file mid-write. A writer that truncates and
@@ -185,6 +221,40 @@ suite "put":
     r = putCertificate(root, noBlock)
     check r.ok and r.kept
     check readFile(r.path) == signed
+
+  test "a relay preserves an existing signed copy when a different signature arrives":
+    let dir = scratchDir()
+    let vectors = pinnedVectors()
+    defer:
+      cleanup(dir)
+      cleanup(vectors.parentDir)
+    let good = readFile(vectors / "store" / "signed" / "certificate.toml")
+    # Keep every signed payload byte, changing only the excluded signature.
+    let bad = good.replace("value = \"", "value = \"AAAA")
+    check bad != good
+    check relativeOf(good) == relativeOf(bad)
+    let first = runCliProcess(["put", "-"], storeEnv(dir), input = good)
+    check first.exitCode == 0
+    let second = runCliProcess(["put", "-"], storeEnv(dir), input = bad)
+    check second.exitCode == 0
+    check readFile(first.output.strip()) == good
+    let kept = putCertificate(dir, bad)
+    check kept.ok and kept.kept
+    check readFile(kept.path) == good
+
+  test "a relay reports malformed and misnamed stored records without replacing them":
+    let dir = scratchDir()
+    defer:
+      cleanup(dir)
+    let text = certificateText(ContentX, signed = true)
+    let path = dir / toNative(relativeOf(text))
+    createDir(path.parentDir)
+    for old in ["malformed", certificateText(ContentX, targets = @["other"])]:
+      writeFile(path, old)
+      let put = putCertificate(dir, text)
+      check not put.ok
+      check put.problem.len > 0
+      check readFile(path) == old
 
   test "put - reads a certificate from standard input; owner-only on a created user root":
     let dir = scratchDir()
@@ -328,7 +398,7 @@ suite "put":
         check "symbolic link" in run.errors
         check toSeq(walkDirRec(elsewhere)).len == 0
 
-      # A link planted at the final name is replaced, never written through.
+      # A link at the final name cannot be inspected safely and is preserved.
       for signed in [false, true]:
         let dir = scratchDir()
         defer:
@@ -345,10 +415,10 @@ suite "put":
           storeEnv(dir / "user", dir / "system"),
           input = doc,
         )
-        check run.exitCode == 0
+        check run.exitCode == 1
+        check "not a regular file" in run.errors
         check readFile(victim) == "victim"
-        check not symlinkExists(path)
-        check readFile(path) == doc
+        check symlinkExists(path)
 
       # The partition itself as a link, and a missing partition.
       block:

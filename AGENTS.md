@@ -31,7 +31,8 @@ just format    # nph, nixfmt
 nix build .#default
 ```
 
-The tests need a checkout of `test-certificates-spec` beside this one (or
+The tests use `ssh-keygen` from the dev shell for real signing controls and
+need a checkout of `test-certificates-spec` beside this one (or
 `TEST_CERTIFICATES_SPEC_DIR`) containing the commit in
 `tests/spec-vectors.pin`.
 

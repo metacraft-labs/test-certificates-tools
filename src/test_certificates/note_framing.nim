@@ -20,8 +20,8 @@
 ## Two operations change a note:
 ##
 ## * ``addRecord`` is the writer rule of Transport §3.1: a record whose
-##   payload is not present is appended; a SIGNED copy of a present payload
-##   replaces the first record carrying it, in place; an unsigned copy never
+##   payload is not present is appended; a SIGNED relay replaces an unsigned
+##   copy only when no signed copy of the payload is present; an unsigned copy never
 ##   replaces anything.
 ## * ``mergeNotes`` is the union two sides of a notes ref meet in (Tooling §3,
 ##   "never one side's"). It starts from the ``base`` blob — the side already
@@ -160,21 +160,26 @@ proc terminateLast(pieces: var seq[NotePiece]): bool =
   false
 
 proc findRecord(pieces: openArray[NotePiece], payloadSha256: string): int =
+  # A signed duplicate anywhere protects the claim, even if an unsigned
+  # duplicate precedes it. This lookup is shared by publish and union merge.
+  result = -1
   for i, p in pieces:
     if p.kind == pkRecord and p.payloadSha256 == payloadSha256:
-      return i
-  -1
+      if p.signed:
+        return i
+      if result < 0:
+        result = i
 
 proc addRecord*(pieces: var seq[NotePiece], record: NotePiece): AddOutcome =
   ## Transport §3.1's writer rule. ``record`` must be a ``pkRecord`` piece
   ## (see ``recordPiece``). A payload already present is never added again;
-  ## a signed copy replaces the first record carrying it, in place, unless
-  ## that record is byte-identical; an unsigned copy changes nothing. A new
+  ## a signed relay replaces an unsigned copy only when no signed copy is
+  ## present; an unsigned copy changes nothing. A new
   ## payload goes after the last piece, behind its own delimiter.
   doAssert record.kind == pkRecord
   let at = findRecord(pieces, record.payloadSha256)
   if at >= 0:
-    if record.signed and pieces[at].body != record.body:
+    if record.signed and not pieces[at].signed and pieces[at].body != record.body:
       pieces[at] = record
       return aoReplaced
     return aoPresent
@@ -212,11 +217,9 @@ proc mergeNotes*(base, other: string): MergedNote =
   ##   with the same payload, in place (§3.1, as ``addRecord``).
   ## * Where both sides carry a signed copy of one payload and the copies
   ##   differ, ``base``'s is kept and the difference is remarked. This is
-  ##   where a merge departs from ``addRecord``: §3.1 lets a new signed copy
-  ##   replace a present one because its writer has just made the signature
-  ##   (§2.3); a merge has made neither, cannot verify either (Tooling §1),
-  ##   and keeping the published copy keeps two clones from trading the
-  ##   record back and forth.
+  ##   the relay rule shared with ``addRecord``: neither operation made
+  ##   the signature or verifies it (Tooling §1). Keeping the published copy
+  ##   also keeps clones from trading records back and forth.
   ## * A piece that does not parse is appended unless ``base`` holds one
   ##   with the same body (ignoring a final LF a previous merge may have
   ##   added).

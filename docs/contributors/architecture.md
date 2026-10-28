@@ -40,8 +40,9 @@ the caller, calls `quit`, or logs.
   define inside `[certificate]`, `[certificate.vcs]` or a command would, if
   dropped, name the record by a payload its producer never computed.
 - **"Signed" means a non-empty signature block.** The tool does not verify
-  (Tooling §1), so the replacement rule of Transport §2.3 is applied to what
-  the block claims. A block with only one of `algorithm`/`value` is refused.
+  (Tooling §1), so it applies Transport §2.3's relay rule: a signed incoming
+  copy upgrades an unsigned stored copy, while an existing signed copy stays.
+  A block with only one of `algorithm`/`value` is refused.
 - **Temporary index, epoch-dated.** The working-tree id is computed in a copy
   of the index whose modification time is set to 1 s after the epoch, with
   `core.fsmonitor=false`, so every entry is racily clean and git compares
@@ -67,11 +68,21 @@ the path no longer leads to the directory it holds open — and recreates the
 directory and retries once. The retry's directory postdates the rename aside,
 so that prune cannot reach it.
 
+**Serializing writers.** Every writer locks the root's persistent `.write-lock`
+file before inspecting an existing certificate and holds it through the atomic
+rename. POSIX uses `openat` with `O_NOFOLLOW` and `flock(LOCK_EX)`; Windows
+uses `CreateFileW` with sharing disabled, waiting on a sharing violation. The
+file is never unlinked: all waiters must continue naming the same lock object.
+Closing the descriptor or process death releases ownership. Signers in other
+implementations follow the same protocol, so a relay cannot inspect an unsigned
+copy and then overwrite a signature another writer has just published.
+
 **The system root.** On POSIX, `put --system` opens the partition with
 `O_NOFOLLOW`, checks it is owned by the writing account, and opens every
 component below it with `openat(…, O_NOFOLLOW | O_DIRECTORY)`. The temporary
-file is created with `O_EXCL | O_NOFOLLOW` and renamed with `renameat`, which
-replaces a planted link rather than following it. Windows lacks the
+file is created with `O_EXCL | O_NOFOLLOW` and renamed with `renameat`.
+An existing nonregular file, including a symbolic link, is reported and left
+unchanged. Windows lacks the
 primitives used here, so `--system` is refused there; reading the system
 root (`find`) works everywhere, with the account's SID from its token.
 

@@ -7,10 +7,11 @@
 ##    beginning with ``.`` and not ending in ``.toml``.
 ## 3. It is flushed (``fsync``), then renamed onto its final name.
 ##
-## When the final name already exists, a SIGNED record replaces it and an
-## UNSIGNED record keeps it: the name is the payload's hash and the signature
-## block is not part of the payload, so the existing file is the same claim,
-## or the same claim signed. The tool does not verify signatures (Tooling §1),
+## This tool relays signatures; it never makes or verifies them. A signed
+## relay replaces an unsigned record, but preserves an existing signed copy.
+## An unsigned record keeps an existing readable, matching record. Malformed,
+## unreadable and misnamed existing records are reported and left unchanged.
+## The name hashes the payload; the signature block is excluded. The tool does not verify signatures (Tooling §1),
 ## so "signed" here means a non-empty ``[certificate.signature]`` block. The
 ## directory of a kept file is touched, so a just-re-tested content does not
 ## look old to the next prune.
@@ -46,7 +47,7 @@ import std/os
 import ./[certificate, layout]
 
 when defined(windows):
-  import std/times
+  import std/[times, widestrs]
 else:
   import std/posix
   import ./posix_at
@@ -62,7 +63,7 @@ type
     path*: string ## The record's full path.
     relative*: string ## ``v1/<algorithm>/<digest>/<hash>.toml``.
     signed*: bool
-    kept*: bool ## Unsigned, and an existing file was left in place.
+    kept*: bool ## An existing copy was preserved by the relay rule.
     retried*: bool ## The first attempt lost its directory to a prune.
     problem*: string
 
@@ -77,6 +78,8 @@ proc systemPutSupported*(): bool =
 when not defined(windows):
   proc errorText(context: string): string =
     context & ": " & $strerror(errno)
+
+  proc flock(fd, operation: cint): cint {.importc, header: "<sys/file.h>".}
 
   proc closeFd(fd: cint) =
     if fd >= 0:
@@ -264,6 +267,23 @@ when not defined(windows):
       let rootFd = opened.fd
       defer:
         closeFd(rootFd)
+      # Every writer, including a signer, locks this persistent root file.
+      # Never unlink it: waiters must continue to name the same inode.
+      let lockFd = openat(
+        rootFd,
+        ".write-lock",
+        O_RDWR or O_CREAT or O_NOFOLLOW or O_CLOEXEC,
+        cint(opened.fileMode),
+      )
+      if lockFd < 0:
+        result.problem = errorText("could not open the store writer lock")
+        return
+      defer:
+        closeFd(lockFd)
+      while flock(lockFd, 2) != 0: # LOCK_EX, common to Linux and BSD/macOS
+        if errno != EINTR:
+          result.problem = errorText("could not lock the store writer lock")
+          return
       let chain = openChain(
         rootFd, root, components, create = true, noFollow = system, opened.dirMode
       )
@@ -284,11 +304,43 @@ when not defined(windows):
         result = sameDirectory(again.fd, dirFd)
         closeFd(again.fd)
 
-      if not signed:
-        var st: Stat
-        if fstatat(dirFd, fileName.cstring, st, AT_SYMLINK_NOFOLLOW) == 0 and
-            S_ISREG(st.st_mode):
-          discard futimens(dirFd, nil) # mark the content written now (see module doc)
+      var st: Stat
+      let exists = fstatat(dirFd, fileName.cstring, st, AT_SYMLINK_NOFOLLOW) == 0
+      if not exists and errno != ENOENT:
+        result.problem = errorText("could not inspect the existing certificate")
+        return
+      if exists and not S_ISREG(st.st_mode):
+        result.problem = "the existing certificate is not a regular file"
+        return
+      if exists:
+        let existingFd =
+          openat(dirFd, fileName.cstring, O_RDONLY or O_NOFOLLOW or O_CLOEXEC)
+        if existingFd < 0:
+          result.problem = errorText("could not inspect the existing certificate")
+          return
+        var existing: File
+        if not open(existing, FileHandle(existingFd), fmRead):
+          closeFd(existingFd)
+          result.problem = "could not read the existing certificate"
+          return
+        var keep: bool
+        try:
+          let parsed = parseCertificate(existing.readAll())
+          if not parsed.ok:
+            result.problem = "the existing certificate is malformed: " & parsed.problem
+            return
+          let oldName = storeNameOf(parsed.certificate)
+          if not oldName.ok or oldName.relativePath != name.relativePath:
+            result.problem = "the existing certificate does not match its store name"
+            return
+          keep = not signed or parsed.certificate.isSigned
+        except CatchableError as err:
+          result.problem = "could not inspect the existing certificate: " & err.msg
+          return
+        finally:
+          existing.close()
+        if keep:
+          discard futimens(dirFd, nil)
           if stillInStore():
             result.ok = true
             result.kept = true
@@ -352,6 +404,20 @@ when not defined(windows):
       return
 
 else:
+  proc createFileW(
+    path: WideCString,
+    access, share: uint32,
+    security: pointer,
+    creation, flags: uint32,
+    templateHandle: int,
+  ): int {.stdcall, dynlib: "kernel32", importc: "CreateFileW".}
+
+  proc closeHandle(
+    handle: int
+  ): int32 {.stdcall, dynlib: "kernel32", importc: "CloseHandle".}
+
+  proc getLastError(): uint32 {.stdcall, dynlib: "kernel32", importc: "GetLastError".}
+
   proc writeRecord(
       root: string,
       name: StoreName,
@@ -365,6 +431,25 @@ else:
     result.path = root / toNative(result.relative)
     result.signed = signed
     let dir = result.path.parentDir
+    try:
+      createDir(root)
+    except OSError as err:
+      result.problem = "could not create the store root: " & err.msg
+      return
+    var lockHandle: int
+    while true:
+      lockHandle = createFileW(
+        newWideCString(root / ".write-lock"), 0xC0000000'u32, 0, nil, 4, 0x80, 0
+      )
+      if lockHandle != -1:
+        break
+      let code = getLastError()
+      if code != 32: # ERROR_SHARING_VIOLATION: another writer owns it.
+        result.problem = "could not open the store writer lock: Windows error " & $code
+        return
+      sleep(10)
+    defer:
+      discard closeHandle(lockHandle)
     for attempt in 0 .. 1:
       result.retried = attempt > 0
       try:
@@ -372,7 +457,22 @@ else:
       except OSError as err:
         result.problem = "could not create '" & dir & "': " & err.msg
         return
-      if not signed and fileExists(result.path):
+      var keep = false
+      if fileExists(result.path):
+        try:
+          let parsed = parseCertificate(readFile(result.path))
+          if not parsed.ok:
+            result.problem = "the existing certificate is malformed: " & parsed.problem
+            return
+          let oldName = storeNameOf(parsed.certificate)
+          if not oldName.ok or oldName.relativePath != name.relativePath:
+            result.problem = "the existing certificate does not match its store name"
+            return
+          keep = not signed or parsed.certificate.isSigned
+        except CatchableError as err:
+          result.problem = "could not inspect the existing certificate: " & err.msg
+          return
+      if keep:
         try:
           setLastModificationTime(dir, getTime())
         except OSError:

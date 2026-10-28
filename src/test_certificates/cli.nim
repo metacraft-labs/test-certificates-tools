@@ -160,7 +160,7 @@ proc putCommand(io: CliIo, args: seq[string]): int =
       io.output.say outcome.path
       if outcome.kept:
         io.errors.say "note: " & outcome.path &
-          " already existed; an unsigned copy keeps it (Transport §2.3)"
+          " already existed; the relay rule preserves it (Transport §2.3)"
       if outcome.retried:
         io.errors.say "note: " & outcome.path &
           " was written on a retry after a concurrent prune"

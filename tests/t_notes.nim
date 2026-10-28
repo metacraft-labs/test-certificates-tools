@@ -22,7 +22,7 @@
 ## host name: the tool's fallback committer identity is exercised on every
 ## host. No mocks.
 
-import std/[osproc, sequtils, sets, streams, strtabs, unittest]
+import std/[base64, osproc, sequtils, sets, streams, strtabs, unittest]
 import ./helpers
 import test_certificates
 
@@ -96,6 +96,54 @@ proc framed(records: varargs[string]): string =
 proc putIn(c: Clone, text: string) =
   let r = putCertificate(c.store, text)
   doAssert r.ok, r.problem
+
+proc reallySigned(text, scratch: string): string =
+  ## Sign the live-tree fixture with the deliberately published vector key.
+  ## This is a real signature so preservation protects a verifying copy.
+  let parsed = parseCertificate(text)
+  doAssert parsed.ok
+  let payload = canonicalPayload(parsed.certificate)
+  doAssert payload.ok
+  let file = scratch / "payload-to-sign"
+  let key = scratch / "insecure-test-key"
+  copyFile(specCheckout() / "vectors" / "signature" / "keys" / "insecure-test-key", key)
+  copyFile(
+    specCheckout() / "vectors" / "signature" / "keys" / "insecure-test-key.pub",
+    key & ".pub",
+  )
+  setFilePermissions(key, {fpUserRead, fpUserWrite})
+  writeFile(file, payload.payload)
+  let signed = runProcess(
+    "ssh-keygen", @["-Y", "sign", "-n", "test-certificate-v1", "-f", key, file], scratch
+  )
+  doAssert signed.exitCode == 0, signed.stderr
+  var encoded = ""
+  for line in readFile(file & ".sig").splitLines():
+    if not line.startsWith("-----"):
+      encoded.add line
+  doAssert decode(encoded).len > 0
+  let allowed = scratch / "allowed-signers"
+  writeFile(allowed, "vector " & readFile(key & ".pub"))
+  let verified = runProcess(
+    "ssh-keygen",
+    @[
+      "-Y",
+      "verify",
+      "-f",
+      allowed,
+      "-I",
+      "vector",
+      "-n",
+      "test-certificate-v1",
+      "-s",
+      file & ".sig",
+    ],
+    scratch,
+    input = payload.payload,
+  )
+  doAssert verified.exitCode == 0, verified.stderr
+  result = text.replace("c2lnbmF0dXJl", encoded)
+  doAssert result != text
 
 proc payloadHashes(blob: string): seq[string] =
   for p in splitNote(blob):
@@ -243,6 +291,31 @@ suite "notes":
     check found.output.splitLines().filterIt(it.len > 0).len == 2
     # Importing again keeps the files (the unsigned one is "kept").
     check tc(b, ["notes", "import", "HEAD"]).exitCode == 0
+
+  test "notes publish and import preserve a signed destination from a damaged relay":
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    let a = newClone(scratch, remote, "a")
+    writeFile(a.dir / "f", "x\n")
+    commitAll(a.dir)
+    let tree = treeOf(a.dir, "HEAD")
+    let good =
+      reallySigned(certificateText("git-tree-sha1:" & tree, signed = true), scratch)
+    let bad = good.replace("value = \"", "value = \"AAAA")
+    check bad != good
+    # Publish relays the bad store record into a note already holding good.
+    putIn(a, bad)
+    writeNote(a.dir, tree, framed(record(good)))
+    check tc(a, ["notes", "publish", "HEAD"]).exitCode == 0
+    check noteBlob(a.dir, tree) == framed(record(good))
+    # Import relays the damaged note into a store already holding good.
+    removeFile(a.store / toNative(relativeOf(good)))
+    putIn(a, good)
+    writeNote(a.dir, tree, framed(record(bad)))
+    check tc(a, ["notes", "import", "HEAD"]).exitCode == 0
+    check readFile(a.store / toNative(relativeOf(good))) == good
 
   test "a push that loses the race merges the union and retries":
     let scratch = scratchDir()
@@ -690,6 +763,21 @@ suite "note blobs":
     check abc.payloadHashes.toHashSet == cba.payloadHashes.toHashSet
     check mergeNotes(abc, cba).changed == false
     check mergeNotes(cba, abc).changed == false
+
+  test "a relay adding a different signed copy preserves the existing signature":
+    let original = record(signedText)
+    let altered = original.replace("c2lnbmF0dXJl", "b3RoZXI=")
+    check altered != original
+    var pieces = splitNote(framed(original))
+    check addRecord(pieces, recordPiece(altered)) == aoPresent
+    check renderNote(pieces) == framed(original)
+    # A malformed carrier can already contain duplicates. A signed copy
+    # anywhere protects the claim, even if an unsigned copy occurs first.
+    pieces = splitNote(framed(record(unsignedTwin), original))
+    check addRecord(pieces, recordPiece(altered)) == aoPresent
+    check renderNote(pieces) == framed(record(unsignedTwin), original)
+    let merged = mergeNotes(framed(record(unsignedTwin), original), framed(altered))
+    check not merged.changed
 
   test "a merge lets a signed copy replace an unsigned one, never the reverse":
     let unsignedSide = framed(record(base), record(unsignedTwin))

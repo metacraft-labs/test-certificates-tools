@@ -57,10 +57,11 @@ path. Exit 0 when every file was written, 1 otherwise (the others are still
 written).
 
 - The file stored is the input, byte for byte.
-- When the name already exists, a **signed** certificate (one with a
-  non-empty `[certificate.signature]` block) replaces it; an **unsigned** one
-  keeps it, since the existing file is the same claim or the same claim
-  signed. `put` does not verify signatures.
+- When the name already exists, a **signed** relay (one with a non-empty
+  `[certificate.signature]` block) replaces an unsigned copy only. It preserves
+  an existing signed copy; an **unsigned** relay keeps either. `put` neither
+  makes nor verifies signatures. A stored record that cannot be read, parsed
+  or matched to its name is reported and left unchanged.
 - A user root created by `put` is readable and writable by its owner only.
 - With `--system`, the partition must already exist (its installer creates
   it, with permissions that let its user read it), must be owned by the
@@ -194,8 +195,8 @@ commit's `<commit>^{tree}` to the note on that tree, in the **local** ref
 only. A revision containing `..` or `^-`, or ending in `^!` or `^@`, is a range; any
 other names one commit. Publishing is idempotent: a record is identified by
 its payload hash, and a payload already in the note is not added again. A
-signed copy replaces an unsigned record of the same payload in place; an
-unsigned copy never replaces anything. Everything else in the note — other
+signed copy replaces an unsigned record of the same payload in place only
+when no signed copy is already present; an unsigned copy never replaces anything. Everything else in the note — other
 frameworks' records, records this tool cannot parse, text before the first
 delimiter — is kept byte for byte. A store file that does not parse is
 reported and not published. Standard output lists `<content-id>

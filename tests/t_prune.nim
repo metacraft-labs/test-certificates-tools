@@ -11,7 +11,7 @@
 ##
 ## No mocks.
 
-import std/[algorithm, sequtils, unittest]
+import std/[algorithm, osproc, sequtils, strtabs, unittest]
 import ./helpers
 import test_certificates
 
@@ -364,7 +364,13 @@ suite "prune":
     let retrying = certificateText(id, targets = @["retrying"])
     let contentDir = store / toNative(relativeOf(first)).parentDir
     var observedDetached = false
-    var retryResult: PutResult
+    var retryingProcess: Process
+    let retryPath = store / toNative(relativeOf(retrying))
+    let incoming = dir / "retrying.toml"
+    writeFile(incoming, retrying)
+    defer:
+      if retryingProcess != nil:
+        retryingProcess.close()
     # The clock the prune's being-written guards compare with, far enough
     # ahead that the writer's fresh directory and temporary file do not
     # protect it: this test is about what happens when a prune DOES choose a
@@ -389,10 +395,17 @@ suite "prune":
             let aside = dotNames(store)
             check aside.len == 1
             check toSeq(walkDir(aside[0])).len == 1
-            # A writer whose attempt this defeated retries NOW, before the
-            # renamed tree is deleted. It must land in a fresh directory
-            # the deletion cannot reach.
-            retryResult = putCertificate(store, retrying)
+            # Another writer starts while the old directory is detached.
+            # It waits on the first writer's root lock. A synchronous call
+            # here would deadlock: serialized writers cannot interleave in
+            # the old test's way, but pruning still can detach the directory.
+            var env = newStringTable(modeCaseSensitive)
+            for key, value in envPairs():
+              env[key] = value
+            env["TEST_CERTIFICATES_DIR"] = store
+            retryingProcess = startProcess(
+              cliBinary(), args = @["put", incoming], env = env, options = {}
+            )
         ,
       )
       check pruned.removed == @[relativeOf(first).parentDir]
@@ -400,10 +413,12 @@ suite "prune":
 
     let r = putCertificate(store, first, beforeRename = hook)
     check observedDetached
-    # The retrying writer survived the deletion of the renamed tree.
-    check retryResult.ok
-    check fileExists(retryResult.path)
-    check readFile(retryResult.path) == retrying
+    # The queued writer succeeds after the interrupted writer releases its
+    # lock. Neither the detached tree's deletion nor the retry removes it.
+    require retryingProcess != nil
+    check retryingProcess.waitForExit() == 0
+    check fileExists(retryPath)
+    check readFile(retryPath) == retrying
     # The interrupted writer noticed (its temporary file vanished with the
     # tree), recreated the directory and retried once.
     check r.ok

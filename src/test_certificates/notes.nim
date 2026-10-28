@@ -100,7 +100,7 @@ type
 
   ImportedRecord* = object
     path*: string ## Where it was stored.
-    kept*: bool ## An unsigned copy found the name taken and kept the file there.
+    kept*: bool ## The relay rule preserved an existing store copy.
 
   ImportedTree* = object
     commit*: string

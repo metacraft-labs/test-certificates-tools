@@ -337,7 +337,8 @@ suite "conformance vectors":
     for required in [
       "appended", "corrupt-middle", "duplicate-not-added", "escaped-newline",
       "foreign-preamble", "signed-and-unsigned", "signed-replaces-unsigned",
-      "single-unsigned", "unsigned-copy-not-added",
+      "single-unsigned", "unsigned-copy-not-added", "signed-copy-not-replaced",
+      "signed-duplicate-protects",
     ]:
       check dirExists(vectors / "notes" / required)
 
