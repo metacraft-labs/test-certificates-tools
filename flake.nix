@@ -147,6 +147,7 @@
               pkgs.coreutils
               pkgs.nixfmt
             ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.acl ]
             ++ config.pre-commit.settings.enabledPackages
             ++ [ config.pre-commit.settings.package ];
           };

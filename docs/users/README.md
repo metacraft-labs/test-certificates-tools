@@ -63,12 +63,17 @@ written).
   makes nor verifies signatures. A stored record that cannot be read, parsed
   or matched to its name is reported and left unchanged.
 - A user root created by `put` is readable and writable by its owner only.
-- With `--system`, the partition must already exist (its installer creates
-  it, with permissions that let its user read it), must be owned by the
-  account running `put`, and no symbolic link below it is ever followed: a
-  planted link fails the write. Directories and files created there take the
-  partition's permission bits. `--system` is not supported on Windows in
-  this release, and says so rather than writing.
+  An existing user root must belong to the effective account running `put`
+  or `prune`; foreign roots are refused without changing their permissions.
+- With `--system`, the installer's partition must already exist and belong to
+  the producer. Its recipient must be a distinct account that can read and
+  traverse it but cannot write it. Existing directories below the partition
+  and the writer lock are checked before use; symbolic links are never followed.
+  Created directories inherit the partition's group and permission bits;
+  records inherit the group and bits with execute removed, even under a
+  restrictive umask. Extended or default ACL policies are explicitly refused
+  because this release cannot preserve them safely. `prune --system` applies
+  the same preconditions before deleting. `--system` is unsupported on Windows.
 - Refused, and nothing written: input that is not TOML, a schema other than
   `test-certificate.v1`, a malformed `content` (or one whose algorithm
   cannot be a directory name on every platform), a missing required field,

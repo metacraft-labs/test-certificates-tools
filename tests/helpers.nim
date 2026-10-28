@@ -16,6 +16,9 @@ import std/[os, strutils, tempfiles, times]
 import test_certificates
 import test_certificates/git
 
+when not defined(windows):
+  import std/posix except Time
+
 export os, strutils, times, git
 
 let repoRoot* = currentSourcePath().parentDir.parentDir
@@ -233,3 +236,14 @@ proc pinnedVectors*(): string =
 proc ageTree*(path: string, secondsAgo: int) =
   ## Date ``path`` ``secondsAgo`` seconds in the past.
   setLastModificationTime(path, getTime() - initDuration(seconds = secondsAgo))
+
+proc recipientAccount*(): string =
+  ## A real, distinct account for system-store tests. The writer cannot also
+  ## be the recipient: its ownership grants write access.
+  when defined(windows):
+    myAccount()
+  else:
+    let entry = getpwnam("nobody")
+    if entry == nil or entry.pw_uid == geteuid():
+      fatal "system-store tests require a distinct nobody account"
+    $entry.pw_uid

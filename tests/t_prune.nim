@@ -245,7 +245,7 @@ suite "prune":
     check noHead.ok
     check noHead.ids.len == 0
     when not defined(windows):
-      let account = myAccount()
+      let account = recipientAccount()
       let partition = dir / "system" / account
       createDir(partition)
       var systemPaths: seq[string]
@@ -328,7 +328,7 @@ suite "prune":
       let dir = scratchDir()
       defer:
         cleanup(dir)
-      let account = myAccount()
+      let account = recipientAccount()
       let partition = dir / "system" / account
       createDir(partition)
       for i in 0 ..< 3:

@@ -48,9 +48,10 @@ import ./[certificate, layout]
 
 when defined(windows):
   import std/[times, widestrs]
+  import ./windows_owner
 else:
   import std/posix
-  import ./posix_at
+  import ./[posix_at, permissions]
 
 type
   PutStepHook* = proc(attempt: int) {.closure.}
@@ -95,7 +96,7 @@ when not defined(windows):
       rootPath: string,
       components: openArray[string],
       create, noFollow: bool,
-      dirMode: int,
+      policy: StorePolicy,
   ): DirOpen =
     ## Open ``components`` below ``rootFd`` one at a time, creating missing
     ## ones when ``create``. With ``noFollow``, a symbolic link at any
@@ -116,7 +117,7 @@ when not defined(windows):
           return
             DirOpen(fd: -1, vanished: true, problem: "'" & shown & "' does not exist")
         var created = true
-        if mkdirat(fd, comp.cstring, Mode(dirMode)) != 0:
+        if mkdirat(fd, comp.cstring, Mode(policy.dirMode)) != 0:
           if errno != EEXIST:
             let problem = errorText("could not create '" & shown & "'")
             closeFd(fd)
@@ -124,23 +125,8 @@ when not defined(windows):
           created = false # another writer made it first
         next = openat(fd, comp.cstring, flags)
         if next >= 0 and created:
-          # `mkdirat` applies the process umask, so a restrictive umask
-          # would leave a system-root directory its user cannot read. The
-          # permission bits are set again through the descriptor, and only
-          # when the umask changed them: `fchmod` by an owner outside the
-          # directory's group clears a set-group-id bit inherited from the
-          # parent, which is how group ownership carries down.
-          var st: Stat
-          if fstat(next, st) != 0:
-            let problem = errorText("could not stat '" & shown & "'")
-            closeFd(next)
-            closeFd(fd)
-            return DirOpen(fd: -1, problem: problem)
-          let perms = int(st.st_mode) and 0o777
-          if perms != (dirMode and 0o777) and
-              fchmod(next, Mode((int(st.st_mode) and 0o7000) or (dirMode and 0o777))) !=
-              0:
-            let problem = errorText("could not set the mode of '" & shown & "'")
+          let problem = applyPolicy(next, policy, directory = true)
+          if problem.len > 0:
             closeFd(next)
             closeFd(fd)
             return DirOpen(fd: -1, problem: problem)
@@ -160,6 +146,12 @@ when not defined(windows):
         let problem = errorText("could not open '" & shown & "'")
         closeFd(fd)
         return DirOpen(fd: -1, problem: problem)
+      if noFollow:
+        let problem = checkAccess(next, shown, policy)
+        if problem.len > 0:
+          closeFd(next)
+          closeFd(fd)
+          return DirOpen(fd: -1, problem: problem)
       closeFd(fd)
       fd = next
     DirOpen(fd: fd)
@@ -182,69 +174,47 @@ when not defined(windows):
 
   proc openRoot(
       root: string, system: bool
-  ): tuple[fd: cint, dirMode, fileMode: int, problem: string] =
+  ): tuple[fd: cint, policy: StorePolicy, problem: string] =
     ## The root's directory descriptor, and the modes for what is created
     ## below it.
-    if system:
-      let fd =
-        posix.open(root.cstring, O_RDONLY or O_DIRECTORY or O_CLOEXEC or O_NOFOLLOW)
-      if fd < 0:
-        if errno == ENOENT:
-          return (
-            cint(-1),
-            0,
-            0,
-            "the system partition '" & root & "' does not exist; it is created " &
-              "by the privileged producer's installer, with ownership and permissions that let its user " &
-              "read it and not write it (Transport §2.3)",
-          )
-        var st: Stat
-        if lstat(root.cstring, st) == 0 and S_ISLNK(st.st_mode):
-          return (
-            cint(-1),
-            0,
-            0,
-            "refusing to follow the symbolic link at the system partition '" & root & "'",
-          )
-        return (
-          cint(-1),
-          0,
-          0,
-          errorText("could not open the system partition '" & root & "'"),
-        )
-      var st: Stat
-      if fstat(fd, st) != 0:
-        let problem = errorText("could not stat '" & root & "'")
-        closeFd(fd)
-        return (cint(-1), 0, 0, problem)
-      if st.st_uid != geteuid():
-        closeFd(fd)
-        return (
-          cint(-1),
-          0,
-          0,
-          "the system partition '" & root & "' is owned by uid " & $st.st_uid &
-            ", not by this producer's account (uid " & $geteuid() &
-            "); a partition its user can " &
-            "write is not one a privileged producer may write into (Transport §2.3)",
-        )
-      let dirMode = int(st.st_mode) and 0o777
-      return (fd, dirMode, dirMode and 0o666, "")
-    if not dirExists(root):
+    if not system and not dirExists(root):
       try:
         let parent = root.parentDir
         if parent.len > 0 and not dirExists(parent):
           createDir(parent)
         if mkdir(root.cstring, Mode(UserDirMode)) != 0 and errno != EEXIST:
-          return
-            (cint(-1), 0, 0, errorText("could not create the user root '" & root & "'"))
+          return (
+            cint(-1),
+            StorePolicy(),
+            errorText("could not create the user root '" & root & "'"),
+          )
       except OSError as err:
-        return
-          (cint(-1), 0, 0, "could not create the user root '" & root & "': " & err.msg)
-    let fd = posix.open(root.cstring, O_RDONLY or O_DIRECTORY or O_CLOEXEC)
+        return (cint(-1), StorePolicy(), err.msg)
+    let flags = O_RDONLY or O_DIRECTORY or O_CLOEXEC or (if system: O_NOFOLLOW else: 0)
+    let fd = posix.open(root.cstring, flags)
     if fd < 0:
-      return (cint(-1), 0, 0, errorText("could not open the user root '" & root & "'"))
-    (fd, UserDirMode, UserFileMode, "")
+      var st: Stat
+      let why =
+        if system and lstat(root.cstring, st) == 0 and S_ISLNK(st.st_mode):
+          "refusing to follow the symbolic link at the system partition '" & root & "'"
+        elif system and errno == ENOENT:
+          "the system partition '" & root &
+            "' does not exist; its installer must create it"
+        else:
+          errorText("could not open the store root '" & root & "'")
+      return (cint(-1), StorePolicy(), why)
+    let checked =
+      if system:
+        systemPolicy(fd, root)
+      else:
+        (
+          policy: StorePolicy(dirMode: UserDirMode, fileMode: UserFileMode),
+          problem: checkOwner(fd, root),
+        )
+    if checked.problem.len > 0:
+      closeFd(fd)
+      return (cint(-1), StorePolicy(), checked.problem)
+    (fd, checked.policy, "")
 
   proc writeRecord(
       root: string,
@@ -267,25 +237,45 @@ when not defined(windows):
       let rootFd = opened.fd
       defer:
         closeFd(rootFd)
+      # Reject an unsafe existing chain before even creating the lock file.
+      # Missing directories are created only after writers are serialized.
+      if system:
+        let checkedChain = openChain(
+          rootFd, root, components, create = false, noFollow = true, opened.policy
+        )
+        if checkedChain.fd >= 0:
+          closeFd(checkedChain.fd)
+        elif not checkedChain.vanished:
+          result.problem = checkedChain.problem
+          return
       # Every writer, including a signer, locks this persistent root file.
       # Never unlink it: waiters must continue to name the same inode.
       let lockFd = openat(
         rootFd,
         ".write-lock",
-        O_RDWR or O_CREAT or O_NOFOLLOW or O_CLOEXEC,
-        cint(opened.fileMode),
+        O_RDWR or O_CREAT or O_NOFOLLOW or O_CLOEXEC or O_NONBLOCK,
+        cint(opened.policy.fileMode),
       )
       if lockFd < 0:
         result.problem = errorText("could not open the store writer lock")
         return
       defer:
         closeFd(lockFd)
+      var lockStat: Stat
+      if fstat(lockFd, lockStat) != 0 or not S_ISREG(lockStat.st_mode):
+        result.problem = "the store writer lock is not a regular file"
+        return
+      let lockProblem =
+        checkAccess(lockFd, root / ".write-lock", opened.policy, requireRead = false)
+      if lockProblem.len > 0:
+        result.problem = lockProblem
+        return
       while flock(lockFd, 2) != 0: # LOCK_EX, common to Linux and BSD/macOS
         if errno != EINTR:
           result.problem = errorText("could not lock the store writer lock")
           return
       let chain = openChain(
-        rootFd, root, components, create = true, noFollow = system, opened.dirMode
+        rootFd, root, components, create = true, noFollow = system, opened.policy
       )
       if chain.fd < 0:
         result.problem = chain.problem
@@ -297,7 +287,7 @@ when not defined(windows):
       # Whether the directory we hold is still the one the path leads to.
       proc stillInStore(): bool =
         let again = openChain(
-          rootFd, root, components, create = false, noFollow = system, opened.dirMode
+          rootFd, root, components, create = false, noFollow = system, opened.policy
         )
         if again.fd < 0:
           return false
@@ -356,7 +346,7 @@ when not defined(windows):
         dirFd,
         temporary.cstring,
         O_WRONLY or O_CREAT or O_EXCL or O_NOFOLLOW or O_CLOEXEC,
-        cint(opened.fileMode),
+        cint(opened.policy.fileMode),
       )
       if tfd < 0:
         if errno == ENOENT and attempt == 0:
@@ -365,12 +355,13 @@ when not defined(windows):
           "could not create a temporary file in '" & result.path.parentDir & "'"
         )
         return
-      var ok =
-        fchmod(tfd, Mode(opened.fileMode)) == 0 and writeAll(tfd, bytes) and
-        fsync(tfd) == 0
+      let permissionProblem = applyPolicy(tfd, opened.policy, directory = false)
+      var ok = permissionProblem.len == 0 and writeAll(tfd, bytes) and fsync(tfd) == 0
       let writeProblem =
         if ok:
           ""
+        elif permissionProblem.len > 0:
+          permissionProblem
         else:
           errorText("could not write '" & temporary & "'")
       if posix.close(tfd) != 0 and ok:
@@ -435,6 +426,10 @@ else:
       createDir(root)
     except OSError as err:
       result.problem = "could not create the store root: " & err.msg
+      return
+    let ownerProblem = checkUserRootOwner(root)
+    if ownerProblem.len > 0:
+      result.problem = ownerProblem
       return
     var lockHandle: int
     while true:

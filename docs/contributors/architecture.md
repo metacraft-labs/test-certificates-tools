@@ -77,14 +77,23 @@ Closing the descriptor or process death releases ownership. Signers in other
 implementations follow the same protocol, so a relay cannot inspect an unsigned
 copy and then overwrite a signature another writer has just published.
 
-**The system root.** On POSIX, `put --system` opens the partition with
-`O_NOFOLLOW`, checks it is owned by the writing account, and opens every
-component below it with `openat(…, O_NOFOLLOW | O_DIRECTORY)`. The temporary
-file is created with `O_EXCL | O_NOFOLLOW` and renamed with `renameat`.
-An existing nonregular file, including a symbolic link, is reported and left
-unchanged. Windows lacks the
-primitives used here, so `--system` is refused there; reading the system
-root (`find`) works everywhere, with the account's SID from its token.
+**Store permission boundaries.** POSIX writers and pruners compare the
+opened root's owner with their effective uid. System operations additionally
+resolve the recipient's real primary and supplementary groups and check its
+read, traverse and nonwrite access on each opened directory. Extended access
+and default ACLs are refused explicitly; mode bits alone cannot establish the
+policy they implement. Created entries receive the partition's group with
+`fchown` and its permission bits with `fchmod`, independently of umask.
+
+`put --system` opens the root and descendants with `O_NOFOLLOW`, checks the
+persistent writer lock is regular, producer-owned and not recipient-writable,
+and creates its temporary file with `O_EXCL | O_NOFOLLOW`. Existing nonregular
+records are reported and left unchanged. System pruning anchors enumeration
+and deletion in held descriptors, preflights nested directories, and unlinks
+symbolic-link entries without traversing them. This includes interrupted-prune
+leftovers and trees detached during the current prune. Windows user-root owner
+checks compare the opened directory's owner SID with the effective token SID;
+system writes and pruning remain unsupported there.
 
 ## The notes carrier
 
@@ -156,6 +165,15 @@ are no mocks. Where a race must be exercised deterministically, the library's
 test seams (`PutStepHook`, `PruneStepHook`, `pruneRoot(now = …)`) choose the
 interleaving and the real code does the rest. Each test file's header says
 what it covers.
+
+On Linux, the permission tests require a distinct `nobody` account,
+noninteractive `sudo -n`, and `setfacl` (included in the dev shell). Elevated
+fixture setup creates foreign-owned roots and a root-owned partition whose
+group is the recipient's group. Separate recipient processes prove that
+records remain readable under umask `077` and that writes and deletion are
+denied. All elevated filesystem operations are confined to temporary test
+directories, which are removed afterwards. The suite fails if it cannot
+establish these real account and permission controls.
 
 The conformance test reads the specification's `store/`, `content/`,
 `payload/` and `notes/` vectors from a checkout of

@@ -36,6 +36,13 @@ need a checkout of `test-certificates-spec` beside this one (or
 `TEST_CERTIFICATES_SPEC_DIR`) containing the commit in
 `tests/spec-vectors.pin`.
 
+Linux permission tests also require a distinct `nobody` account, `setfacl`
+(provided by the dev shell), and noninteractive `sudo -n`. They create
+isolated temporary stores owned by other accounts and run real producer and
+recipient processes; elevated commands touch only those fixtures. Missing
+prerequisites fail the tests. Run the suite on a development/test host with
+these permissions available.
+
 ## Layout
 
 | Path                            | Contents                                                                                              |

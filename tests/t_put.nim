@@ -373,7 +373,7 @@ suite "put":
       check run.exitCode == 1
       check "not supported" in run.errors
     else:
-      let account = myAccount()
+      let account = recipientAccount()
       let text = certificateText(ContentX)
       let relative = relativeOf(text)
       let parts = relative.split('/') # v1, algorithm, digest, file
@@ -381,7 +381,11 @@ suite "put":
         result = dir / "system" / account
         createDir(result)
         setFilePermissions(
-          result, {fpUserRead, fpUserWrite, fpUserExec, fpGroupRead, fpGroupExec}
+          result,
+          {
+            fpUserRead, fpUserWrite, fpUserExec, fpGroupRead, fpGroupExec, fpOthersRead,
+            fpOthersExec,
+          },
         )
 
       # Success first: the partition's permission bits carry down.
@@ -397,8 +401,8 @@ suite "put":
         )
         check run.exitCode == 0
         check run.output.strip() == partition / relative
-        check modeOf(partition / "v1") == 0o750
-        check modeOf(partition / relative) == 0o640
+        check modeOf(partition / "v1") == 0o755
+        check modeOf(partition / relative) == 0o644
         check not dirExists(dir / "user") # the user root is not touched
 
       # The same under a restrictive umask: what is created still takes the
@@ -417,9 +421,9 @@ suite "put":
         )
         checkpoint run.stderr
         check run.exitCode == 0
-        check modeOf(partition / "v1") == 0o750
-        check modeOf(partition / parts[0] / parts[1] / parts[2]) == 0o750
-        check modeOf(partition / relative) == 0o640
+        check modeOf(partition / "v1") == 0o755
+        check modeOf(partition / parts[0] / parts[1] / parts[2]) == 0o755
+        check modeOf(partition / relative) == 0o644
 
       # A link planted in place of each directory below the partition.
       for depth in 1 .. 3:

@@ -25,9 +25,10 @@ import ./[content_id, layout]
 
 when defined(windows):
   import std/winlean
+  import ./windows_owner
 else:
   import std/posix except Time
-  import ./posix_at
+  import ./[posix_at, permissions]
 
 const
   DefaultKeep* = 20 ## The reference policy (Transport §2.5).
@@ -66,7 +67,7 @@ proc renameAside(path, aside: string): tuple[ok: bool, problem: string] =
       return (false, $strerror(errno))
   (true, "")
 
-proc beingWritten(dir: string, now: Time): bool =
+proc beingWritten(dir: string, now: Time, noFollow = false): bool =
   ## Whether a producer may be writing into ``dir`` right now. Anything that
   ## cannot be established counts as "yes": removing a directory in use is
   ## worse than keeping one a little longer.
@@ -78,8 +79,11 @@ proc beingWritten(dir: string, now: Time): bool =
   try:
     for kind, path in walkDir(dir, checkDir = true):
       if isTemporaryName(path.extractFilename):
+        if noFollow and kind in {pcLinkToDir, pcLinkToFile}:
+          continue # A symbolic link is not a writer's temporary record.
         try:
-          if now - getLastModificationTime(path) < StaleTemporaryAge:
+          if now - getFileInfo(path, followSymlink = not noFollow).lastWriteTime <
+              StaleTemporaryAge:
             return true
         except OSError:
           return true # renamed into place a moment ago: a write as well
@@ -87,35 +91,91 @@ proc beingWritten(dir: string, now: Time): bool =
     return true
   false
 
-proc checkSystemPartition(root: string): string =
-  ## ``prune --system`` is run by the partition's owner (Transport §2.5: a
-  ## privileged producer prunes the partitions it writes). Refuse a partition
-  ## it does not own, and symbolic links down to ``v1/<algorithm>``, so the
-  ## deletion can only ever reach the partition's own tree.
-  when defined(windows):
-    "`prune --system` is not supported on this platform"
-  else:
-    var st: Stat
-    if lstat(root.cstring, st) != 0:
+when not defined(windows):
+  proc descriptorPath(fd: cint): string =
+    when defined(linux):
+      "/proc/self/fd/" & $fd
+    else:
+      "/dev/fd/" & $fd
+
+  proc inspectSystemTree(fd: cint, shown: string, policy: StorePolicy): string =
+    ## Preflight every directory, including interrupted-prune leftovers,
+    ## before detaching it. Links are entries to unlink, never to traverse.
+    result = checkAccess(fd, shown, policy)
+    if result.len > 0:
       return
-        "the system partition '" & root & "' cannot be examined: " & $strerror(errno)
-    if S_ISLNK(st.st_mode):
+    try:
+      for kind, path in walkDir(descriptorPath(fd), checkDir = true):
+        if kind == pcDir:
+          let child = openat(
+            fd,
+            path.lastPathPart.cstring,
+            O_RDONLY or O_DIRECTORY or O_CLOEXEC or O_NOFOLLOW,
+          )
+          if child < 0:
+            return "could not inspect system tree without following links"
+          let problem = inspectSystemTree(child, shown / path.lastPathPart, policy)
+          discard posix.close(child)
+          if problem.len > 0:
+            return problem
+    except OSError as err:
+      return "could not inspect the system tree: " & err.msg
+
+  proc removeSystemTree(fd: cint, policy: StorePolicy): string =
+    ## Delete only through held directory descriptors. In particular, an
+    ## unlinked symbolic-link entry never becomes a traversal during cleanup.
+    result = checkAccess(fd, descriptorPath(fd), policy)
+    if result.len > 0:
       return
-        "refusing to follow the symbolic link at the system partition '" & root & "'"
-    if not S_ISDIR(st.st_mode):
-      return "the system partition '" & root & "' is not a directory"
-    if st.st_uid != geteuid():
+    try:
+      for kind, path in walkDir(descriptorPath(fd), checkDir = true):
+        let name = path.lastPathPart
+        if kind == pcDir:
+          let child =
+            openat(fd, name.cstring, O_RDONLY or O_DIRECTORY or O_CLOEXEC or O_NOFOLLOW)
+          if child < 0:
+            return "could not open system cleanup directory"
+          let problem = removeSystemTree(child, policy)
+          var held, named: Stat
+          let same =
+            fstat(child, held) == 0 and
+            fstatat(fd, name.cstring, named, AT_SYMLINK_NOFOLLOW) == 0 and
+            held.st_dev == named.st_dev and held.st_ino == named.st_ino
+          discard posix.close(child)
+          if problem.len > 0:
+            return problem
+          if not same:
+            return "system cleanup directory changed during deletion"
+          if unlinkat(fd, name.cstring, AT_REMOVEDIR) != 0:
+            return "could not remove system cleanup directory: " & $strerror(errno)
+        elif unlinkat(fd, name.cstring, 0) != 0:
+          return "could not unlink a system cleanup entry: " & $strerror(errno)
+    except OSError as err:
+      return "could not list system cleanup directory: " & err.msg
+
+  proc deleteHeldSystemTree(fd: cint, path: string, policy: StorePolicy): string =
+    ## Keep the object selected for deletion across the rename and cleanup.
+    var held, named: Stat
+    if fstat(fd, held) != 0 or lstat(path.cstring, named) != 0 or
+        held.st_dev != named.st_dev or held.st_ino != named.st_ino:
+      return "detached system tree changed before cleanup"
+    result = removeSystemTree(fd, policy)
+    if result.len > 0:
       return
-        "the system partition '" & root & "' is owned by uid " & $st.st_uid &
-        ", not by this account (uid " & $geteuid() & "); only its owner prunes it"
-    let layout = root / LayoutVersion
-    if lstat(layout.cstring, st) == 0 and S_ISLNK(st.st_mode):
-      return "refusing to follow the symbolic link at '" & layout & "'"
-    if dirExists(layout):
-      for kind, path in walkDir(layout):
-        if kind == pcLinkToDir or kind == pcLinkToFile:
-          return "refusing to follow the symbolic link at '" & path & "'"
-    ""
+    if lstat(path.cstring, named) != 0 or held.st_dev != named.st_dev or
+        held.st_ino != named.st_ino:
+      return "detached system tree changed during cleanup"
+    if rmdir(path.cstring) != 0:
+      return "could not remove detached system tree: " & $strerror(errno)
+
+  proc deleteSystemPath(path: string, policy: StorePolicy): string =
+    let fd =
+      posix.open(path.cstring, O_RDONLY or O_DIRECTORY or O_CLOEXEC or O_NOFOLLOW)
+    if fd < 0:
+      return "could not open detached system tree"
+    defer:
+      discard posix.close(fd)
+    deleteHeldSystemTree(fd, path, policy)
 
 proc pruneRoot*(
     root: string,
@@ -134,33 +194,140 @@ proc pruneRoot*(
   if root.len == 0:
     result.errors.add "no store root to prune"
     return
-  if system:
-    let problem = checkSystemPartition(root)
-    if problem.len > 0:
-      result.errors.add problem
+  var anchoredRoot = root
+  when defined(windows):
+    if system:
+      result.errors.add "`prune --system` is not supported on this platform"
       return
+    if dirExists(root):
+      let problem = checkUserRootOwner(root)
+      if problem.len > 0:
+        result.errors.add problem
+        return
+  else:
+    var heldFds: seq[cint]
+    defer:
+      for fd in heldFds:
+        discard posix.close(fd)
+    var policy: StorePolicy
+    if system or dirExists(root):
+      let flags =
+        O_RDONLY or O_DIRECTORY or O_CLOEXEC or (if system: O_NOFOLLOW else: 0)
+      let fd = posix.open(root.cstring, flags)
+      if fd < 0:
+        result.errors.add "could not open the store root without following a symbolic link: " &
+          $strerror(errno)
+        return
+      heldFds.add fd
+      let checked =
+        if system:
+          systemPolicy(fd, root)
+        else:
+          (policy: StorePolicy(), problem: checkOwner(fd, root))
+      if checked.problem.len > 0:
+        result.errors.add checked.problem
+        return
+      policy = checked.policy
+      # Paths through an opened descriptor keep the root anchored if another
+      # producer renames it. Each system descendant is opened and checked in
+      # turn before it is enumerated or mutated.
+      when defined(linux):
+        anchoredRoot = "/proc/self/fd/" & $fd
+      elif defined(macosx):
+        anchoredRoot = "/dev/fd/" & $fd
+      else:
+        if system:
+          result.errors.add "system pruning needs descriptor-anchored paths on this platform"
+          return
+
+  var heldLayout = anchoredRoot / LayoutVersion
+  when not defined(windows):
+    if system:
+      let fd = posix.open(
+        heldLayout.cstring, O_RDONLY or O_DIRECTORY or O_CLOEXEC or O_NOFOLLOW
+      )
+      if fd < 0:
+        if errno == ENOENT:
+          result.ok = true
+          return
+        result.errors.add "could not open layout without following a symbolic link: " &
+          $strerror(errno)
+        return
+      heldFds.add fd
+      let problem = checkAccess(fd, root / LayoutVersion, policy)
+      if problem.len > 0:
+        result.errors.add problem
+        return
+      heldLayout = anchoredRoot.parentDir / $fd
   var protectedDirs: seq[string]
   for id in protectedIds:
     let parsed = parseContentId(id)
     if parsed.form != cifMalformed:
       protectedDirs.add contentDirRelative(parsed.algorithmName, parsed.digest)
-  let layout = root / LayoutVersion
+  let layout = heldLayout
   result.ok = true
   if not dirExists(layout):
     return # an empty or missing store: nothing to do
-  var dirs: seq[tuple[relative: string, mtime: Time]]
+  var dirs: seq[tuple[relative, parent: string, mtime: Time]]
   try:
     for algorithmKind, algorithmPath in walkDir(layout, checkDir = true):
+      if system and algorithmKind in {pcLinkToDir, pcLinkToFile}:
+        result.ok = false
+        result.errors.add "refusing to follow the symbolic link at '" & algorithmPath &
+          "'"
+        return
       if algorithmKind != pcDir or algorithmPath.extractFilename.startsWith("."):
         continue
-      for digestKind, digestPath in walkDir(algorithmPath, checkDir = true):
+      var heldAlgorithm = algorithmPath
+      when not defined(windows):
+        if system:
+          let fd = posix.open(
+            algorithmPath.cstring, O_RDONLY or O_DIRECTORY or O_CLOEXEC or O_NOFOLLOW
+          )
+          if fd < 0:
+            result.ok = false
+            result.errors.add "could not open algorithm without following a symbolic link: " &
+              $strerror(errno)
+            return
+          heldFds.add fd
+          let problem = checkAccess(fd, algorithmPath, policy)
+          if problem.len > 0:
+            result.ok = false
+            result.errors.add problem
+            return
+          heldAlgorithm = anchoredRoot.parentDir / $fd
+      for digestKind, digestPath in walkDir(heldAlgorithm, checkDir = true):
         let name = digestPath.extractFilename
+        when not defined(windows):
+          if system and digestKind == pcDir:
+            let fd = posix.open(
+              digestPath.cstring, O_RDONLY or O_DIRECTORY or O_CLOEXEC or O_NOFOLLOW
+            )
+            if fd < 0:
+              result.ok = false
+              result.errors.add "could not inspect system content directory"
+              return
+            let problem = inspectSystemTree(fd, digestPath, policy)
+            discard posix.close(fd)
+            if problem.len > 0:
+              result.ok = false
+              result.errors.add problem
+              return
         if name.startsWith("."):
           # Never a content directory; any pruner may delete it.
           if digestKind == pcDir:
             try:
-              removeDir(digestPath)
-              result.leftovers.add digestPath
+              when not defined(windows):
+                if system:
+                  let problem = deleteSystemPath(digestPath, policy)
+                  if problem.len > 0:
+                    raise newException(OSError, problem)
+                else:
+                  removeDir(digestPath)
+              else:
+                removeDir(digestPath)
+              result.leftovers.add root / LayoutVersion / algorithmPath.extractFilename /
+                name
             except OSError as err:
               if dirExists(digestPath):
                 result.errors.add "'" & digestPath & "' could not be removed: " & err.msg
@@ -170,6 +337,7 @@ proc pruneRoot*(
         try:
           dirs.add (
             LayoutVersion & "/" & algorithmPath.extractFilename & "/" & name,
+            heldAlgorithm,
             getLastModificationTime(digestPath),
           )
         except OSError:
@@ -179,7 +347,7 @@ proc pruneRoot*(
     result.errors.add "the store at '" & layout & "' could not be listed: " & err.msg
     return
   dirs.sort(
-    proc(a, b: tuple[relative: string, mtime: Time]): int =
+    proc(a, b: tuple[relative, parent: string, mtime: Time]): int =
       if a.mtime != b.mtime:
         return (if a.mtime > b.mtime: -1 else: 1)
       -cmp(a.relative, b.relative)
@@ -188,12 +356,37 @@ proc pruneRoot*(
     if i < keep or entry.relative in protectedDirs:
       result.kept.add entry.relative
       continue
-    let path = root / toNative(entry.relative)
-    if beingWritten(path, now):
+    let path = entry.parent / entry.relative.extractFilename
+    if beingWritten(path, now, noFollow = system):
       result.busy.add entry.relative
       continue
     if onStep != nil:
       onStep(psChosen, entry.relative)
+    when not defined(windows):
+      var selectionFd = cint(-1)
+      defer:
+        if selectionFd >= 0:
+          discard posix.close(selectionFd)
+      if system:
+        # The selection hook stands for concurrent activity. Reopen and check
+        # afterwards, then retain that exact object across detach and cleanup.
+        selectionFd =
+          posix.open(path.cstring, O_RDONLY or O_DIRECTORY or O_CLOEXEC or O_NOFOLLOW)
+        if selectionFd < 0:
+          result.ok = false
+          result.errors.add "selected system directory changed before detaching"
+          return
+        let problem = inspectSystemTree(selectionFd, path, policy)
+        if problem.len > 0:
+          result.ok = false
+          result.errors.add problem
+          return
+        var held, named: Stat
+        if fstat(selectionFd, held) != 0 or lstat(path.cstring, named) != 0 or
+            held.st_dev != named.st_dev or held.st_ino != named.st_ino:
+          result.ok = false
+          result.errors.add "selected system directory changed before detaching"
+          return
     let aside = path.parentDir / removalName(path.extractFilename)
     let renamed = renameAside(path, aside)
     if not renamed.ok:
@@ -204,7 +397,15 @@ proc pruneRoot*(
     if onStep != nil:
       onStep(psDetached, entry.relative)
     try:
-      removeDir(aside)
+      when not defined(windows):
+        if system:
+          let problem = deleteHeldSystemTree(selectionFd, aside, policy)
+          if problem.len > 0:
+            raise newException(OSError, problem)
+        else:
+          removeDir(aside)
+      else:
+        removeDir(aside)
     except OSError as err:
       result.errors.add "'" & aside &
         "' could not be removed (a later prune deletes it): " & err.msg

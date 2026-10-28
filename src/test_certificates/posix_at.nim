@@ -23,6 +23,7 @@ import std/posix
 var
   O_NOFOLLOW* {.importc: "O_NOFOLLOW", header: "<fcntl.h>".}: cint
   O_DIRECTORY* {.importc: "O_DIRECTORY", header: "<fcntl.h>".}: cint
+  AT_REMOVEDIR* {.importc: "AT_REMOVEDIR", header: "<fcntl.h>".}: cint
   AT_SYMLINK_NOFOLLOW* {.importc: "AT_SYMLINK_NOFOLLOW", header: "<fcntl.h>".}: cint
 
 proc openat*(
