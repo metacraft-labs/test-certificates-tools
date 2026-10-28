@@ -153,6 +153,159 @@ suite "store roots":
     for bad in ["S-1-", "S-1-5-x", "1000", "S-1-5-21-..\\x"]:
       check systemPartition(rpWindows, envOf({"ProgramData": "C:\\PD"}), bad).path == ""
 
+  test "every store variable requires an absolute path on its platform":
+    for platform in [rpUnix, rpMacos, rpWindows]:
+      let account = if platform == rpWindows: "S-1-5-21-1000" else: "1000"
+      let absolute = if platform == rpWindows: r"C:\state" else: "/state"
+      var cases = @[
+        ("TEST_CERTIFICATES_DIR", absolute, ""),
+        (
+          "TEST_CERTIFICATES_SYSTEM_DIR",
+          (if platform == rpWindows: r"C:\state\S-1-5-21-1000" else: "/state/1000"),
+          (
+            case platform
+            of rpUnix: "/var/lib/test-certificates/1000"
+            of rpMacos: "/Library/Application Support/test-certificates/1000"
+            of rpWindows: ""
+          ),
+        ),
+      ]
+      case platform
+      of rpUnix:
+        cases.add ("XDG_STATE_HOME", "/state/test-certificates", "")
+        cases.add ("HOME", "/state/.local/state/test-certificates", "")
+      of rpMacos:
+        cases.add ("HOME", "/state/Library/Application Support/test-certificates", "")
+      of rpWindows:
+        cases.add ("LOCALAPPDATA", r"C:\state\test-certificates", "")
+        cases.add ("ProgramData", r"C:\state\test-certificates\S-1-5-21-1000", "")
+      for (variable, resolved, fallback) in cases:
+        # Unset and empty are separate environment inputs. In each case only
+        # this variable can supply the selected root, exposing its own rule.
+        for value in [absolute, "relative", "C:drive-relative", "", "<unset>"]:
+          var values: seq[(string, string)]
+          if value != "<unset>":
+            values.add (variable, value)
+          let r = resolveRoots(platform, envOf(values), account)
+          let system = variable in ["TEST_CERTIFICATES_SYSTEM_DIR", "ProgramData"]
+          let actual = if system: r.system else: r.user
+          checkpoint $platform & " " & variable & "=" & value
+          check actual == (if value == absolute: resolved else: fallback)
+          let problem = r.problems.join("\n")
+          if value in ["relative", "C:drive-relative"]:
+            check variable & (if platform == rpWindows: "%" else: "") &
+              " is set to the relative path" in problem
+          if actual.len == 0:
+            check "the " & (if system: "system" else: "user") &
+              " root cannot be resolved" in problem
+
+  test "relative fallback variables never resolve against the current directory":
+    # Platform and environment are the resolver's real inputs, so all platforms
+    # can be exercised on every host without mocking an operating system.
+    for platform in [rpUnix, rpMacos]:
+      for home in ["relative-home", ""]:
+        let r = resolveRoots(platform, envOf({"HOME": home}), "1000")
+        check r.user == ""
+        check r.system.len > 0
+        check "the user root cannot be resolved" in r.problems[^1]
+        if home.len > 0:
+          check "$HOME is set to the relative path" in r.problems[0]
+        else:
+          check r.problems.len == 1
+    let sid = "S-1-5-21-123-456-789-1000"
+    for value in ["relative-data", "C:drive-relative", ""]:
+      let r = resolveRoots(
+        rpWindows, envOf({"LOCALAPPDATA": value, "ProgramData": value}), sid
+      )
+      check r.user == ""
+      check r.system == ""
+      check r.systemBase == ""
+      check "the system root cannot be resolved" in r.problems[^1]
+      if value.len > 0:
+        check "%LOCALAPPDATA% is set to the relative path" in r.problems[0]
+        check "%ProgramData% is set to the relative path" in r.problems[2]
+      else:
+        check r.problems.len == 2
+    # Absolute overrides resolve both roots; unused relative fallbacks need no
+    # diagnostic because they were never read.
+    for platform in [rpUnix, rpMacos, rpWindows]:
+      let user = if platform == rpWindows: r"C:\certs" else: "/certs"
+      let base = if platform == rpWindows: r"C:\system" else: "/system"
+      let account = if platform == rpWindows: sid else: "1000"
+      let r = resolveRoots(
+        platform,
+        envOf(
+          {
+            "TEST_CERTIFICATES_DIR": user,
+            "TEST_CERTIFICATES_SYSTEM_DIR": base,
+            "XDG_STATE_HOME": "relative",
+            "HOME": "relative",
+            "LOCALAPPDATA": "relative",
+            "ProgramData": "relative",
+          }
+        ),
+        account,
+      )
+      check r.user == user
+      check r.system == (
+        if platform == rpWindows:
+          r"C:\system\S-1-5-21-123-456-789-1000"
+        else: "/system/1000"
+      )
+      check r.problems.len == 0
+    # One invalid Windows fallback does not disable the other root, and an
+    # invalid system override falls back to an absolute ProgramData.
+    let r = resolveRoots(
+      rpWindows,
+      envOf(
+        {
+          "LOCALAPPDATA": "relative",
+          "ProgramData": r"C:\PD",
+          "TEST_CERTIFICATES_SYSTEM_DIR": "relative-system",
+        }
+      ),
+      sid,
+    )
+    check r.user == ""
+    check r.system == r"C:\PD\test-certificates\S-1-5-21-123-456-789-1000"
+
+  test "an unresolved user root is reported and cannot receive a write":
+    let dir = scratchDir()
+    defer:
+      cleanup(dir)
+    let content = "git-tree-sha1:" & repeat('7', 40)
+    let text = certificateText(content)
+    let env = @[
+      ("TEST_CERTIFICATES_DIR", "relative-store"),
+      ("XDG_STATE_HOME", "relative-state"),
+      ("HOME", "relative-home"),
+      ("LOCALAPPDATA", "relative-local"),
+      ("TEST_CERTIFICATES_SYSTEM_DIR", dir / "system"),
+    ]
+    let root = runCliProcess(["store-root"], env, cwd = dir)
+    check root.exitCode == 1
+    check root.output.startsWith("user: (unresolved)\n")
+    check "the user root cannot be resolved" in root.errors
+    let empty = runCliProcess(["find", "--content", content], env, cwd = dir)
+    check empty.exitCode == 3
+    check empty.output == ""
+    check "searched user root (unresolved) [unresolved]" in empty.errors
+    let put = runCliProcess(["put", "-"], env, cwd = dir, input = text)
+    check put.exitCode != 0
+    check put.output == ""
+    check "the user root cannot be resolved" in put.errors
+    for relative in [
+      "relative-store", "relative-state", "relative-home", "relative-local"
+    ]:
+      check not dirExists(dir / relative)
+    # An unresolved user root must not hide a candidate in the system root.
+    let stored = putCertificate(dir / "system" / myAccount(), text)
+    require stored.ok
+    let found = runCliProcess(["find", "--content", content], env, cwd = dir)
+    check found.exitCode == 0
+    check found.output == stored.path & "\n"
+    check "searched user root (unresolved) [unresolved]" in found.errors
+
   test "the executable resolves this host's roots from the real environment":
     let account = myAccount()
     when defined(windows):
