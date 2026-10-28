@@ -16,6 +16,8 @@
 ##   computed both natively from the entries and through the git route.
 ## * ``payload/``: ``fields.json`` serialized, and any ``received.toml``
 ##   parsed and re-serialized, byte-compared with ``canonical.txt``.
+## * ``verify/unknown-keys``: every malformed record is refused before naming,
+##   including unknown claims in the excluded signature block (Standard §3.4).
 ## * ``notes/``: ``note.txt`` split per Transport §3.1 and every piece
 ##   compared with ``expected.json``; for a writer case ``add.txt`` added and
 ##   the blob byte-compared with ``expected-note.txt`` (notes_framing_vectors).
@@ -295,6 +297,30 @@ suite "conformance vectors":
     for f in payloadFailures:
       checkpoint f
     check payloadFailures.len == 0
+
+  test "closed record schema vectors are all refused before naming":
+    let vectors = pinnedVectors()
+    defer:
+      cleanup(vectors.parentDir)
+    let dir = vectors / "verify" / "unknown-keys"
+    let expected = parseJson(readFile(dir / "expected.json"))
+    check expected["outcome"].getStr == "not-covered"
+    var checked: seq[string]
+    for rejected in expected["rejected"]:
+      let name = rejected["certificate"].getStr
+      checkpoint name
+      let parsed = parseCertificate(readFile(dir / "certificates" / name))
+      check not parsed.ok
+      check "not a field" in parsed.problem
+      checked.add name
+    var present: seq[string]
+    for kind, path in walkDir(dir / "certificates"):
+      if kind == pcFile:
+        present.add path.extractFilename
+    checked.sort()
+    present.sort()
+    check checked == present
+    check checked.len == 7
 
   test "notes_framing_vectors":
     let vectors = pinnedVectors()

@@ -64,3 +64,31 @@ suite "library api":
     check readFile(outPath).startsWith("test-certificates " & Version & "\n")
     check "unknown command no-such-command" in readFile(errPath)
     check "could not read" in readFile(errPath)
+
+  test "unknown keys and tables are malformed at every record level":
+    let valid = certificateText("git-tree-sha1:" & repeat('5', 40))
+    check parseCertificate(valid).ok
+    check parseCertificate(
+      valid & "\n[certificate.signature]\nalgorithm = ''\nvalue = ''\n"
+    ).ok
+    for malformed in [
+      "unexpected = 'claim'\n" & valid,
+      valid.replace("[certificate]", "[certificate]\nunexpected = 'claim'"),
+      valid.replace("[certificate.vcs]", "[certificate.vcs]\nunexpected = 'claim'"),
+      valid.replace(
+        "[[certificate.command]]", "[[certificate.command]]\nunexpected = 'claim'"
+      ),
+      valid &
+        "\n[certificate.signature]\nalgorithm = ''\nvalue = ''\nunexpected = 'claim'\n",
+      valid & "\n[extension]\nunexpected = 'claim'\n",
+      valid & "\n[extension]\n",
+      valid & "\n[certificate.extension]\n",
+      valid & "\n[certificate.vcs.extension]\n",
+      valid & "\n[certificate.command.extension]\n",
+      valid & "\n[certificate.signature.extension]\n",
+      valid &
+        "\n[certificate.signature]\nalgorithm = ''\nvalue = ''\n[certificate.signature.extension]\nunexpected = 'claim'\n",
+    ]:
+      let parsed = parseCertificate(malformed)
+      check not parsed.ok
+      check "not a field" in parsed.problem

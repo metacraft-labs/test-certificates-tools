@@ -18,11 +18,10 @@
 ## * a value holds a control character Canonical-Payload §4 cannot represent;
 ## * ``key_id`` or ``base`` is present but empty (Canonical-Payload §2 rules 3
 ##   and 10: those are omitted, never emitted empty);
-## * a key this revision does not define appears inside ``[certificate]``,
-##   ``[certificate.vcs]`` or a ``[[certificate.command]]``. Dropping it would
-##   name the record by a payload its producer never computed (an
-##   earlier-draft record's ``commit``/``clean`` is the case in point,
-##   Canonical-Payload §7.1);
+## * an unknown key or table appears anywhere, including the document root
+##   and ``[certificate.signature]`` (Standard §3.4). Dropping it would name
+##   only part of the received claim, even when the signature block is excluded
+##   from the canonical payload (Canonical-Payload §5);
 ## * a signature block with only one of ``algorithm`` and ``value``.
 ##
 ## Specification: Canonical-Payload.md and Standard.md §3 of the
@@ -269,6 +268,9 @@ proc parseCertificate*(text: string): CertificateParse =
       "schema `" & schema.str & "` is not " & SchemaV1 &
         ", the only schema this store layout names"
     )
+  for key in doc.keys:
+    if key notin ["schema", "certificate"]:
+      bad("`" & key & "` is not a field of " & SchemaV1)
   let cert = doc.get("certificate")
   if cert.isNil or cert.kind != tkTable:
     bad("the [certificate] table is missing")
@@ -335,6 +337,9 @@ proc parseCertificate*(text: string): CertificateParse =
   else:
     if signature.kind != tkTable:
       bad("`certificate.signature` must be a table")
+    for key in signature.keys:
+      if key notin ["algorithm", "value"]:
+        bad("`certificate.signature." & key & "` is not a field of " & SchemaV1)
     let (hasAlgorithm, algorithm) =
       str(signature, "algorithm", "certificate.signature.", problem, optional = true)
     let (hasValue, value) =
