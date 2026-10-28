@@ -148,16 +148,18 @@ proc recordPiece*(record: string): NotePiece =
   ## a delimiter): the delimiter line, then the record.
   pieceAfterDelimiter(NoteDelimiter & "\n" & record)
 
-proc terminateLast(pieces: var seq[NotePiece]): bool =
-  ## Make sure the blob ends in LF before a piece is appended, so the
-  ## appended delimiter starts a line. Only a blob some other writer left
-  ## without its final LF needs this; answers whether a byte was added.
-  if pieces.len > 0 and pieces[^1].raw.len > 0 and pieces[^1].raw[^1] != '\n':
-    pieces[^1].raw.add '\n'
-    if pieces[^1].kind == pkLeading or pieces[^1].raw.len > NoteDelimiter.len + 1:
-      pieces[^1].body.add '\n'
+proc terminatePiece(piece: var NotePiece): bool =
+  ## Preserve a following delimiter's line boundary when this piece changes.
+  if piece.raw.len > 0 and piece.raw[^1] != '\n':
+    piece.raw.add '\n'
+    if piece.kind == pkLeading or piece.raw.len > NoteDelimiter.len + 1:
+      piece.body.add '\n'
     return true
   false
+
+proc terminateLast(pieces: var seq[NotePiece]): bool =
+  ## Appending requires a line boundary after the current last piece.
+  pieces.len > 0 and terminatePiece(pieces[^1])
 
 proc findRecord(pieces: openArray[NotePiece], payloadSha256: string): int =
   # A signed duplicate anywhere protects the claim, even if an unsigned
@@ -244,6 +246,8 @@ proc mergeNotes*(base, other: string): MergedNote =
         pieces.insert(p, 0)
         result.changed = true
         inc result.added
+      if pieces.len > 1 and terminatePiece(pieces[0]):
+        result.remarks.add "the leading text did not end in LF; one was added before the following delimiter"
     of pkRecord:
       let at = findRecord(pieces, p.payloadSha256)
       if at < 0:
@@ -259,6 +263,8 @@ proc mergeNotes*(base, other: string): MergedNote =
           pieces[at].body = p.body
           pieces[at].signed = true
           pieces[at].certificate = p.certificate
+          if at + 1 < pieces.len and terminatePiece(pieces[at]):
+            result.remarks.add "the replacing record did not end in LF; one was added before the following delimiter"
           result.changed = true
           inc result.replaced
         elif p.signed and pieces[at].signed:

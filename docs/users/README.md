@@ -222,9 +222,11 @@ moved, it fetches it, merges the **union** of both sides' records into the
 local ref, and tries again — five attempts in all, with backoff. **`notes
 fetch`** fetches the remote ref and merges it into the local one the same
 way. The merge never lets one side win: for every annotated tree, the result
-holds every record of both sides, each payload once (a signed copy replaces
-an unsigned one; of two differently signed copies, the remote's is kept), and
-every piece neither side can parse. When one side already contains the other
+keeps the remote pieces in their order, then appends missing local records and
+unparsable pieces in local order. A signed copy upgrades an unsigned match;
+when signed copies differ, the remote's copy is kept and the conflict reported.
+Existing duplicate payloads are preserved. Different leading blocks join once,
+and a supplied LF is reported when needed to preserve a delimiter boundary. When one side already contains the other
 the ref just moves forward. A merge is an ordinary two-parent commit, so
 `git log <ref>` shows both histories. Both print the resulting ref value on
 standard output.

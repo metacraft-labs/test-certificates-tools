@@ -764,6 +764,23 @@ suite "note blobs":
     check mergeNotes(abc, cba).changed == false
     check mergeNotes(cba, abc).changed == false
 
+  test "merge repairs an inserted leading block before a published delimiter":
+    let published = framed(record(base))
+    let merged = mergeNotes(published, "foreign")
+    check merged.blob == "foreign\n" & published
+    check merged.remarks.len == 1
+    check merged.blob.payloadHashes == published.payloadHashes
+    check not mergeNotes(merged.blob, "foreign").changed
+
+  test "merge repairs a replacement before the next published delimiter":
+    let published = framed(record(unsignedTwin), record(base))
+    let incoming = framed(record(signedText))[0 ..^ 2]
+    let merged = mergeNotes(published, incoming)
+    check merged.blob == framed(record(signedText), record(base))
+    check merged.remarks.len == 1
+    check merged.blob.payloadHashes == published.payloadHashes
+    check not mergeNotes(merged.blob, incoming).changed
+
   test "a relay adding a different signed copy preserves the existing signature":
     let original = record(signedText)
     let altered = original.replace("c2lnbmF0dXJl", "b3RoZXI=")

@@ -136,7 +136,12 @@ copies the remote's is kept, because a merge has made neither signature and
 cannot verify either, and keeping the published copy stops two clones from
 trading the record back and forth. Ordering is therefore deterministic —
 the remote's pieces in its order, then the local additions in local order —
-and merging the same local side again changes nothing. The merged tree is
+and merging the same local side again changes nothing. Leading-block
+containment requires a contiguous sequence of whole lines; corrupt-piece
+equality ignores at most one final LF. Inserting a leading block or replacing
+a record before another delimiter supplies and reports a missing LF so the
+delimiter remains on its own line. Exact merge bytes and diagnostic categories
+are pinned by the standard's `notes/merge-*` vectors. The merged tree is
 built on the remote commit and committed with both commits as parents. When
 one side is an ancestor of the other the ref is moved, not merged.
 

@@ -223,6 +223,27 @@ proc checkNotesGroup(vectors: string): seq[string] =
   ## the presence of a signature block.
   for dir in caseDirs(vectors, "notes"):
     let name = dir.extractFilename
+    if name.startsWith("merge-"):
+      let other = readFile(dir / "other.txt")
+      let merged = mergeNotes(readFile(dir / "base.txt"), other)
+      if merged.blob != readFile(dir / "expected-note.txt"):
+        result.add name & ": merge did not produce expected-note.txt"
+      var categories: seq[string]
+      for remark in merged.remarks:
+        if "published copy was kept" in remark:
+          categories.add "signed-conflict"
+        elif "text before the first delimiter" in remark:
+          categories.add "leading-joined"
+        elif "LF" in remark:
+          categories.add "lf-repair"
+        else:
+          categories.add "unrecognised report: " & remark
+      let reports = parseJson(readFile(dir / "expected.json"))["reports"]
+      if %categories != reports:
+        result.add name & ": merge reports differ: " & $categories
+      if mergeNotes(merged.blob, other).blob != merged.blob:
+        result.add name & ": repeated merge grew the note"
+      continue
     let note = readFile(dir / "note.txt")
     let pieces = splitNote(note)
     if renderNote(pieces) != note:
@@ -364,7 +385,12 @@ suite "conformance vectors":
       "appended", "corrupt-middle", "duplicate-not-added", "escaped-newline",
       "foreign-preamble", "signed-and-unsigned", "signed-replaces-unsigned",
       "single-unsigned", "unsigned-copy-not-added", "signed-copy-not-replaced",
-      "signed-duplicate-protects",
+      "signed-duplicate-protects", "merge-order", "merge-signed-upgrade",
+      "merge-empty-signature-upgrade", "merge-unsigned-downgrade",
+      "merge-signed-conflict", "merge-signed-duplicate", "merge-leading",
+      "merge-leading-present", "merge-leading-substring", "merge-corrupt-lf",
+      "merge-eof-append", "merge-eof-delimiter", "merge-eof-noop", "merge-leading-eof",
+      "merge-replacement-eof",
     ]:
       check dirExists(vectors / "notes" / required)
 
@@ -391,6 +417,11 @@ suite "conformance vectors":
     let canonicalFile = vectors / "payload" / "minimal" / "canonical.txt"
     writeFile(canonicalFile, readFile(canonicalFile).replace("passed", "failed"))
     check checkPayloadGroup(vectors).len == 1
+    # Two-blob output and diagnostics are load-bearing independently.
+    let mergeBytes = vectors / "notes" / "merge-order" / "expected-note.txt"
+    writeFile(mergeBytes, readFile(mergeBytes) & "extra")
+    let mergeReports = vectors / "notes" / "merge-signed-conflict" / "expected.json"
+    writeFile(mergeReports, "{\"reports\": []}\n")
     # notes/: a reader expectation (a skipped piece claimed to be a record),
     # and one byte of a writer's expected note.
     let piecesFile = vectors / "notes" / "foreign-preamble" / "expected.json"
@@ -404,9 +435,11 @@ suite "conformance vectors":
     let notesFailures = checkNotesGroup(vectors)
     for f in notesFailures:
       checkpoint f
-    check notesFailures.len == 2
+    check notesFailures.len == 4
     check notesFailures.anyIt(it.startsWith("foreign-preamble:"))
     check notesFailures.anyIt(it.startsWith("appended:"))
+    check notesFailures.anyIt(it.startsWith("merge-order:"))
+    check notesFailures.anyIt(it.startsWith("merge-signed-conflict:"))
 
   test "negative controls: the pin is honoured":
     let spec = specCheckout()
