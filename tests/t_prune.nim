@@ -100,6 +100,227 @@ suite "prune":
       check runCliProcess(@["prune"] & args, storeEnv(store, dir / "system")).exitCode ==
         2
 
+  test "prune protects the committed manifest even with zero retention":
+    let dir = scratchDir()
+    defer:
+      cleanup(dir)
+    let repo = newRepo()
+    defer:
+      cleanup(repo)
+    writeFile(repo / "f", "committed\n")
+    commitAll(repo)
+    let manifest = computeContentId(repo, commitState("HEAD"), caManifestV1Sha256)
+    require manifest.outcome == coComputed
+    let stored = putCertificate(dir / "store", certificateText(manifest.id))
+    require stored.ok
+    ageTree(stored.path.parentDir, 1000)
+    let run =
+      runCliProcess(["prune", "--keep", "0"], storeEnv(dir / "store"), cwd = repo)
+    checkpoint run.errors
+    check run.exitCode == 0
+    check fileExists(stored.path)
+    check run.output.len == 0
+
+  test "declared HEAD scopes protect both algorithms but not their subsets or dirty states":
+    for format in ["sha1", "sha256"]:
+      let dir = scratchDir()
+      defer:
+        cleanup(dir)
+      let repo = newRepo(format)
+      defer:
+        cleanup(repo)
+      for name in ["src", "lib", "tests", "--literal", "other"]:
+        writeFile(repo / name, name & " committed\n")
+      commitAll(repo)
+      let scopes = @[@["src", "lib"], @["tests"], @["--literal"]]
+      var expected: seq[string]
+      var paths: seq[string]
+      for scope in @[newSeq[string]()] & scopes:
+        let normalized = scope
+        for manifest in [false, true]:
+          let id =
+            if manifest:
+              computeContentId(
+                repo, commitState("HEAD"), caManifestV1Sha256, normalized
+              )
+            else:
+              computeContentId(repo, commitState("HEAD"), normalized)
+          require id.outcome == coComputed
+          let stored = putCertificate(dir / "store", certificateText(id.id))
+          require stored.ok
+          paths.add stored.path
+          expected.add relativeOf(certificateText(id.id)).parentDir
+      # Undeclared subsets do not become scopes, and modified state does not
+      # substitute for the content actually committed at HEAD.
+      var removed: seq[string]
+      for scope in [@["src"], @["lib"], @["other"]]:
+        let id = computeContentId(repo, commitState("HEAD"), scope)
+        require id.outcome == coComputed
+        let stored = putCertificate(dir / "store", certificateText(id.id))
+        require stored.ok
+        removed.add stored.path
+      writeFile(repo / "src", "staged\n")
+      discard gitIn(repo, ["add", "src"])
+      writeFile(repo / "src", "working tree\n")
+      let indexBefore = readFile(repo / ".git" / "index")
+      for state in [stagedState(), worktreeState()]:
+        let id = computeContentId(repo, state)
+        require id.outcome == coComputed
+        let stored = putCertificate(dir / "store", certificateText(id.id))
+        require stored.ok
+        removed.add stored.path
+      for path in paths & removed:
+        ageTree(path.parentDir, 1000)
+      let run = runCliProcess(
+        [
+          "prune", "--keep", "0", "--paths", "src", "lib", "--paths", "tests",
+          "--paths", "--", "--literal",
+        ],
+        storeEnv(dir / "store"),
+        cwd = repo,
+      )
+      checkpoint run.errors
+      check run.exitCode == 0
+      for path in paths:
+        check fileExists(path)
+      for path in removed:
+        check not fileExists(path)
+      expected.sort()
+      check contentDirs(dir / "store") == expected
+      check readFile(repo / ".git" / "index") == indexBefore
+      check readFile(repo / "src") == "working tree\n"
+
+  test "bare repositories protect HEAD, and failed protection never prunes":
+    let dir = scratchDir()
+    defer:
+      cleanup(dir)
+    let repo = newRepo()
+    defer:
+      cleanup(repo)
+    writeFile(repo / "f", "committed\n")
+    commitAll(repo)
+    let bare = dir / "bare.git"
+    discard gitIn(dir, ["clone", "--bare", "-q", repo, bare])
+    let native = computeContentId(repo, commitState("HEAD"))
+    let manifest = computeContentId(repo, commitState("HEAD"), caManifestV1Sha256)
+    var paths: seq[string]
+    for id in [native.id, manifest.id]:
+      let stored = putCertificate(dir / "store", certificateText(id))
+      require stored.ok
+      paths.add stored.path
+      ageTree(stored.path.parentDir, 1000)
+    let run =
+      runCliProcess(["prune", "--keep", "0"], storeEnv(dir / "store"), cwd = bare)
+    checkpoint run.errors
+    check run.exitCode == 0
+    for path in paths:
+      check fileExists(path)
+    let leftover =
+      dir / "store" / "v1" / "git-tree-sha1" / (".old" & RemovalMarker & "1")
+    createDir(leftover)
+    writeFile(leftover / "partial", "keep on refusal")
+    for args in [@["--paths"], @["--paths", "../bad"], @["--paths", "f", "--paths"]]:
+      check runCliProcess(
+        @["prune", "--keep", "0"] & args, storeEnv(dir / "store"), cwd = repo
+      ).exitCode == 2
+      for path in paths:
+        check fileExists(path)
+      check dirExists(leftover)
+    let outside = runCliProcess(
+      ["prune", "--keep", "0", "--paths", "f"], storeEnv(dir / "store"), cwd = dir
+    )
+    check outside.exitCode == 1
+    check dirExists(leftover)
+    let unborn = newRepo()
+    defer:
+      cleanup(unborn)
+    let requested = runCliProcess(
+      ["prune", "--keep", "0", "--paths", "f"], storeEnv(dir / "store"), cwd = unborn
+    )
+    check requested.exitCode == 1
+    for path in paths:
+      check fileExists(path)
+    check dirExists(leftover)
+    let noHead = headContentIds(unborn)
+    check noHead.ok
+    check noHead.ids.len == 0
+    when not defined(windows):
+      let account = myAccount()
+      let partition = dir / "system" / account
+      createDir(partition)
+      var systemPaths: seq[string]
+      for id in [native.id, manifest.id]:
+        let stored = putCertificate(partition, certificateText(id), system = true)
+        require stored.ok
+        systemPaths.add stored.path
+        ageTree(stored.path.parentDir, 1000)
+      let systemRun = runCliProcess(
+        ["prune", "--keep", "0", "--system", account],
+        storeEnv(dir / "store", dir / "system"),
+        cwd = repo,
+      )
+      checkpoint systemRun.errors
+      check systemRun.exitCode == 0
+      for path in systemPaths:
+        check fileExists(path)
+    # Break a real committed blob: native HEAD still resolves, but manifest
+    # computation fails. No content or interrupted-prune leftover may go.
+    let blob = gitIn(repo, ["rev-parse", "HEAD:f"]).strip()
+    removeFile(repo / ".git" / "objects" / blob[0 .. 1] / blob[2 ..^ 1])
+    let broken =
+      runCliProcess(["prune", "--keep", "0"], storeEnv(dir / "store"), cwd = repo)
+    checkpoint broken.errors
+    check broken.exitCode == 1
+    for path in paths:
+      check fileExists(path)
+    check dirExists(leftover)
+
+  test "damaged repository discovery refuses before deleting contents or leftovers":
+    let dir = scratchDir()
+    defer:
+      cleanup(dir)
+    let repo = newRepo()
+    defer:
+      cleanup(repo)
+    writeFile(repo / "f", "committed\n")
+    commitAll(repo)
+    let bare = dir / "bare.git"
+    discard gitIn(dir, ["clone", "--bare", "-q", repo, bare])
+    let stored = putCertificate(dir / "store", certificateText(idOf(73)))
+    require stored.ok
+    ageTree(stored.path.parentDir, 1000)
+    let leftover =
+      dir / "store" / "v1" / "git-tree-sha1" / (".old" & RemovalMarker & "1")
+    createDir(leftover)
+    writeFile(leftover / "partial", "retain on refusal")
+    for repository in [repo, bare]:
+      let head = (if repository == repo: repo / ".git" else: bare) / "HEAD"
+      let original = readFile(head)
+      for missing in [false, true]:
+        if missing:
+          removeFile(head)
+        else:
+          writeFile(head, "damaged\n")
+        createDir(repository / "subdirectory")
+        for cwd in [repository, repository / "subdirectory"]:
+          let run =
+            runCliProcess(["prune", "--keep", "0"], storeEnv(dir / "store"), cwd = cwd)
+          checkpoint run.errors
+          check run.exitCode == 1
+          check fileExists(stored.path)
+          check dirExists(leftover)
+        writeFile(head, original)
+    check not headContentIds(dir / "missing").ok
+    let noGit = runCliProcess(
+      ["prune", "--keep", "0"],
+      storeEnv(dir / "store") & @[("PATH", dir / "no-executables")],
+      cwd = repo,
+    )
+    checkpoint noGit.errors
+    check noGit.exitCode == 1
+    check fileExists(stored.path)
+    check dirExists(leftover)
+
   test "prune --system prunes a partition its owner holds, and refuses a link":
     when defined(windows):
       skip()

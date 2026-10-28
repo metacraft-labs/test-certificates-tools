@@ -38,7 +38,7 @@ Usage:
   test-certificates put [--system <user>] <file>...|-
   test-certificates find (--content <id> | --commit <rev> | --staged | --worktree)
                          [--paths <path>...] [--algorithm <algorithm>]
-  test-certificates prune [--keep <n>] [--system <user>]
+  test-certificates prune [--keep <n>] [--system <user>] [--paths <path>...]...
   test-certificates notes publish <commit>|<range>...
   test-certificates notes import [<commit>|<range>...]
   test-certificates notes (push|fetch) <remote>
@@ -53,7 +53,8 @@ Commands:
               id, from both roots. Exit 0 found, 1 complete empty search,
               2 uncomputable id, 3 incomplete empty search, 64 usage error.
   prune       Remove content directories beyond the newest n (default 20),
-              never the one for the current repository's HEAD^{tree}.
+              protecting HEAD in native git-tree and manifest algorithms,
+              unscoped and in each scope declared by a --paths group.
   notes       Carry certificates in git notes on each commit's tree, in the
               notes ref (git config testCertificates.notesRef, default
               refs/notes/test-certificates/certificates):
@@ -301,6 +302,7 @@ proc findCommand(io: CliIo, args: seq[string]): int =
 proc pruneCommand(io: CliIo, args: seq[string]): int =
   var keep = DefaultKeep
   var system = ""
+  var scopes: seq[seq[string]]
   var i = 0
   while i < args.len:
     let a = args[i]
@@ -319,6 +321,25 @@ proc pruneCommand(io: CliIo, args: seq[string]): int =
         return usageError(io, "--keep needs a non-negative number, not `" & v & "`")
       if keep < 0:
         return usageError(io, "--keep needs a non-negative number, not `" & v & "`")
+    elif a == "--paths":
+      var scope: seq[string]
+      inc i
+      while i < args.len and not args[i].startsWith("--"):
+        scope.add args[i]
+        inc i
+      if i < args.len and args[i] == "--":
+        inc i
+        while i < args.len:
+          scope.add args[i]
+          inc i
+      if scope.len == 0:
+        return usageError(io, "--paths needs at least one path")
+      for path in scope:
+        let problem = scopePathProblem(path)
+        if problem.len > 0:
+          return usageError(io, problem)
+      scopes.add scope
+      continue
     elif a == "--system":
       if i + 1 >= args.len:
         return usageError(io, "--system needs a user (a uid, or a SID on Windows)")
@@ -342,13 +363,14 @@ proc pruneCommand(io: CliIo, args: seq[string]): int =
       io.errors.say "test-certificates: " & r.problems.join("; ")
       return 1
     root = r.user
-  # Never the directory of the current repository's HEAD^{tree}, where there
-  # is one (Transport §2.5). Outside a repository there is nothing to keep.
-  var protectedIds: seq[string]
-  let head = headTree(getCurrentDir())
-  if head.ok:
-    protectedIds.add head.id
-    io.errors.say "keeping the content of HEAD^{tree}: " & head.id
+  # Resolve every protection before pruneRoot can rename or delete anything.
+  let protection = headContentIds(getCurrentDir(), scopes)
+  if not protection.ok:
+    io.errors.say "test-certificates: " & protection.problem
+    return 1
+  let protectedIds = protection.ids
+  for id in protectedIds:
+    io.errors.say "keeping the content of HEAD^{tree}: " & id
   let r = pruneRoot(root, keep, protectedIds, system = system.len > 0)
   for d in r.removed:
     io.output.say d

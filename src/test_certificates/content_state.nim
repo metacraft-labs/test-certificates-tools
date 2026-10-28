@@ -324,12 +324,21 @@ proc computeImpl(
     return failed("`" & state.revision & "` is not a revision")
 
   let top = git(repository, ["rev-parse", "--show-toplevel"])
+  var topPath = singleLine(top.stdout)
   if not top.ok:
-    return
-      failed("`" & repository & "` is not inside a git working tree: " & top.failure)
+    # A committed state needs only objects, so a bare repository can compute
+    # it too. Index and worktree states still require a working tree.
+    let bare = git(repository, ["rev-parse", "--is-bare-repository"])
+    if state.kind != skCommit or not bare.ok or singleLine(bare.stdout) != "true":
+      return
+        failed("`" & repository & "` is not inside a git working tree: " & top.failure)
+    let directory = git(repository, ["rev-parse", "--absolute-git-dir"])
+    if not directory.ok:
+      return failed(directory.failure)
+    topPath = singleLine(directory.stdout)
   # Every later command runs at the top level, so repo-relative scope paths
   # mean the same thing whatever directory the caller is in.
-  let toplevel = singleLine(top.stdout)
+  let toplevel = topPath
   let format = repositoryTreeAlgorithm(toplevel)
   if not format.ok:
     return failed(format.problem)
@@ -503,3 +512,89 @@ proc headTree*(repository: string): tuple[ok: bool, id: string] =
     (true, computed.id)
   else:
     (false, "")
+
+type HeadContentIds* = object
+  ## Protection computed before any destructive store operation. An empty
+  ## successful result means there is no repository or HEAD to protect.
+  ok*: bool
+  ids*: seq[string]
+  problem*: string
+
+proc headContentIds*(
+    repository: string, scopes: seq[seq[string]] = @[]
+): HeadContentIds =
+  ## Both computable algorithms for one frozen HEAD tree, unscoped and in
+  ## every explicitly declared scope. Never infers scopes from store files.
+  for scope in scopes:
+    if scope.len == 0:
+      return HeadContentIds(problem: "an explicit scope needs at least one path")
+    for path in scope:
+      let problem = scopePathProblem(path)
+      if problem.len > 0:
+        return HeadContentIds(problem: problem)
+  # Git has no distinct exit status for ordinary non-repository discovery.
+  # Accept only its specific, locale-stable discovery diagnostic as absence;
+  # missing executables, bad cwd, ownership refusals and damaged metadata
+  # cannot authorize an unprotected prune.
+  let directory =
+    gitRun(repository, ["rev-parse", "--git-dir"], env = [("LC_ALL", "C")])
+  if not directory.started:
+    return HeadContentIds(problem: "cannot discover repository: " & directory.failure)
+  if directory.exitCode != 0:
+    let absent =
+      directory.stderr.startsWith(
+        "fatal: not a git repository (or any of the parent directories)"
+      ) or
+      directory.stderr.startsWith(
+        "fatal: not a git repository (or any parent up to mount point"
+      )
+    if not absent:
+      return HeadContentIds(
+        problem: "cannot discover repository: " & directory.stderr.strip()
+      )
+    # Git also reports ordinary absence when HEAD is missing or malformed.
+    # Repository metadata is evidence that discovery failed, not permission to
+    # discard HEAD protection. Check ancestors too, for calls in subdirectories
+    # and in bare repositories whose HEAD can no longer identify them to Git.
+    var ancestor = absolutePath(repository)
+    while true:
+      let marker = ancestor / ".git"
+      if fileExists(marker) or dirExists(marker) or symlinkExists(marker) or
+          (dirExists(ancestor / "objects") and dirExists(ancestor / "refs")):
+        return HeadContentIds(
+          problem: "cannot discover repository with existing metadata: " & ancestor
+        )
+      let parent = parentDir(ancestor)
+      if parent.len == 0 or parent == ancestor:
+        break
+      ancestor = parent
+    if scopes.len > 0:
+      return
+        HeadContentIds(problem: "cannot protect explicit scopes outside a repository")
+    return HeadContentIds(ok: true)
+  let resolved = git(repository, ["rev-parse", "--verify", "--quiet", "HEAD^{tree}"])
+  if not resolved.ok:
+    # Only a genuinely unborn symbolic HEAD permits an empty protection set.
+    # A damaged or unreadable existing HEAD must not authorize deletion.
+    let symbolic = git(repository, ["symbolic-ref", "-q", "HEAD"])
+    if symbolic.ok:
+      let present = gitRun(
+        repository, ["show-ref", "--verify", "--quiet", singleLine(symbolic.stdout)]
+      )
+      if present.started and present.exitCode == 1 and scopes.len == 0:
+        return HeadContentIds(ok: true)
+    return HeadContentIds(problem: "cannot resolve HEAD tree: " & resolved.failure)
+  let tree = singleLine(resolved.stdout)
+  var allScopes: seq[seq[string]] = @[@[]]
+  allScopes.add scopes
+  for scope in allScopes:
+    let native = computeContentId(repository, commitState(tree), scope)
+    let manifest =
+      computeContentId(repository, commitState(tree), caManifestV1Sha256, scope)
+    for computed in [native, manifest]:
+      if computed.outcome != coComputed:
+        return
+          HeadContentIds(problem: "cannot protect HEAD content: " & computed.problem)
+      if computed.id notin result.ids:
+        result.ids.add computed.id
+  result.ok = true

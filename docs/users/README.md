@@ -137,19 +137,33 @@ its own.
 ### `prune`
 
 ```
-test-certificates prune [--keep <n>] [--system <user>]
+test-certificates prune [--keep <n>] [--system <user>] [--paths <path>...]...
 ```
 
 Removes content directories beyond the newest `n` (default 20, by
 modification time) from the user root, or from a system partition when run
-by its owner. Never removes the directory for the current repository's
-`HEAD^{tree}`, nor one a producer is writing into. Each directory is renamed
+by its owner. Protects the unscoped content of `HEAD` in the repository's
+native `git-tree-*` algorithm and in `manifest-v1-sha256`, plus both ids for
+each explicitly declared scope. Each `--paths` group is one scope: for example,
+`--paths src lib --paths tests` declares `["src", "lib"]` and `["tests"]`,
+without implicitly declaring `["src"]` or `["lib"]`. Paths are literal and
+repository-relative; `--` within a group makes its remaining paths literal
+arguments, including names starting with `-`. Scopes are never inferred from
+stored certificates. Protection is additional to the newest `n`, even at zero.
+
+All ids use one fixed `HEAD` tree, including in bare repositories; staged and
+working-tree changes do not affect them. Outside a repository or on an unborn
+branch there is no automatic protection. Explicit scopes without `HEAD`, or a
+failure computing an id for an existing `HEAD`, abort before any deletion,
+including leftover cleanup. Never removes a directory a producer is writing into. Each directory is renamed
 aside to a `.`-prefixed name before it is deleted, so a writer racing the
 prune retries safely; leftovers of an interrupted prune are deleted and never
 count as content. Prints each removed directory. Exit 0, or 1 when something
 could not be removed (reported), 2 on a usage error.
 
-Library: `pruneRoot(root, keep, protectedIds, system = false): PruneResult`.
+Library: `headContentIds(repository, scopes): HeadContentIds` computes the
+complete protection set (check `ok` before pruning), then
+`pruneRoot(root, keep, protectedIds, system = false): PruneResult` applies it.
 
 ### `notes`
 

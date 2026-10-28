@@ -3,8 +3,8 @@
 ##
 ## * The newest ``keep`` content directories, by modification time (which
 ##   writing a file updates), are kept, plus every PROTECTED one — the
-##   directory of the current repository's ``HEAD^{tree}``, when the caller
-##   knows one. Ties are broken by name, so the choice is deterministic.
+##   caller supplies the unscoped and declared scoped HEAD ids in each
+##   computed algorithm. Ties are broken by name for deterministic selection.
 ## * A directory a producer is writing into is never removed: one modified
 ##   within ``FreshDirectoryAge``, or holding a temporary file younger than
 ##   ``StaleTemporaryAge`` (a writer creates the directory a moment before it
