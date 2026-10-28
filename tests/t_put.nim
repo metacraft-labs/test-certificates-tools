@@ -133,8 +133,37 @@ suite "put":
       let good = readFile(vectors / "store" / "signed" / "certificate.toml")
       let unsigned = good.split("\n[certificate.signature]")[0] & "\n"
       let bad = good.replace("value = \"", "value = \"AAAA")
-      let first = putCertificate(dir, unsigned)
+      # Precreate the lock so unfixed writers reach the behavioral control.
+      let prepared =
+        posix.open((dir / ".write-lock").cstring, O_RDWR or O_CREAT, Mode(0o600))
+      require prepared >= 0
+      discard posix.close(prepared)
+      var contender: cint = -1
+      var inspectedLock = false
+      defer:
+        if contender >= 0:
+          discard posix.close(contender)
+      let first = putCertificate(
+        dir,
+        unsigned,
+        beforeRename = proc(attempt: int) =
+          inspectedLock = true
+          # Separate open file descriptions contend even in one process.
+          contender = posix.open((dir / ".write-lock").cstring, O_RDWR)
+          require contender >= 0
+          let acquired = flock(contender, 2 or 4) # LOCK_EX | LOCK_NB
+          let lockError = errno
+          check acquired == -1
+          check lockError == EWOULDBLOCK or lockError == EAGAIN
+          if acquired == 0:
+            discard flock(contender, 8) # Let the negative control finish cleanly.
+        ,
+      )
       check first.ok
+      check inspectedLock
+      # Returning from put must also release its lock.
+      check flock(contender, 2 or 4) == 0
+      check flock(contender, 8) == 0
       # Act as another conforming signer, holding the same persistent lock
       # and replacing its unsigned copy while the relay is waiting.
       let fd = posix.open((dir / ".write-lock").cstring, O_RDWR or O_CREAT, Mode(0o600))
@@ -255,6 +284,23 @@ suite "put":
       check not put.ok
       check put.problem.len > 0
       check readFile(path) == old
+    when not defined(windows):
+      # Permission denial must remain an error even for an unsigned relay;
+      # it cannot establish what copy exists without reading the record.
+      require geteuid() != 0 # This control needs an unprivileged test account.
+      writeFile(path, text)
+      setFilePermissions(path, {})
+      try:
+        let unsigned = text.split("\n[certificate.signature]")[0] & "\n"
+        for incoming in [text, unsigned]:
+          let put = putCertificate(dir, incoming)
+          check not put.ok
+          check "could not inspect" in put.problem
+          check modeOf(path) == 0
+      finally:
+        setFilePermissions(path, {fpUserRead, fpUserWrite})
+      check readFile(path) == text
+      check modeOf(path) == 0o600
 
   test "put - reads a certificate from standard input; owner-only on a created user root":
     let dir = scratchDir()
