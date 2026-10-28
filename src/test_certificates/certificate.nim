@@ -389,7 +389,7 @@ proc contentDirOf*(
 ): tuple[ok: bool, algorithm, digest, problem: string] =
   ## The two directory components a content id names: split at its FIRST
   ## `:`. Requires a well-formed id, or a well-formed one in an algorithm
-  ## Content-Id §4 does not define whose name is a safe directory name.
+  ## Content-Id §4 does not define. Both obey Content-Id §1's grammar.
   let parsed = parseContentId(contentId)
   case parsed.form
   of cifMalformed:
@@ -400,18 +400,7 @@ proc contentDirOf*(
       "content id `" & contentId & "` is malformed: " & parsed.problem &
         " (Content-Id §1)",
     )
-  of cifUnknownAlgorithm:
-    if not isSafeStoreComponent(parsed.algorithmName):
-      (
-        false,
-        "",
-        "",
-        "content id `" & contentId &
-          "` names an algorithm that cannot be a directory name",
-      )
-    else:
-      (true, parsed.algorithmName, parsed.digest, "")
-  of cifWellFormed:
+  of cifUnknownAlgorithm, cifWellFormed:
     (true, parsed.algorithmName, parsed.digest, "")
 
 proc storeNameOf*(c: Certificate): StoreName =

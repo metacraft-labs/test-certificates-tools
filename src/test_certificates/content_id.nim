@@ -57,6 +57,20 @@ proc isLowerHex(s: string): bool =
       return false
   true
 
+proc isSafeStoreComponent*(name: string): bool =
+  ## Content-Id §1's portable algorithm identifier grammar. The bound and
+  ## device exclusions apply before lookup, including on non-Windows hosts.
+  if name.len == 0 or name.len > 64:
+    return false
+  for c in name:
+    if c notin {'a' .. 'z', '0' .. '9', '-'}:
+      return false
+  if name in ["con", "prn", "aux", "nul"]:
+    return false
+  if name.len == 4 and name[0 .. 2] in ["com", "lpt"] and name[3] in {'1' .. '9'}:
+    return false
+  true
+
 proc parseContentId*(text: string): ContentId =
   ## Classify ``text`` per Content-Id §1. Never repairs: an uppercase or
   ## abbreviated digest is malformed, not "close enough".
@@ -71,6 +85,10 @@ proc parseContentId*(text: string): ContentId =
   if result.algorithmName.len == 0:
     result.form = cifMalformed
     result.problem = "nothing precedes the `:`"
+    return
+  if not isSafeStoreComponent(result.algorithmName):
+    result.form = cifMalformed
+    result.problem = "the algorithm identifier is not portable"
     return
   if not isLowerHex(result.digest):
     result.form = cifMalformed
@@ -95,30 +113,6 @@ proc parseContentId*(text: string): ContentId =
 
 proc formatContentId*(algorithm: ContentAlgorithm, digest: string): string =
   $algorithm & ":" & digest
-
-proc isSafeStoreComponent*(name: string): bool =
-  ## Whether ``name`` can be a directory name inside a store root on every
-  ## platform without escaping its parent: a well-formed id's digest is
-  ## lowercase hex and always qualifies; an algorithm outside Content-Id §4
-  ## is only known to be "everything before the first `:`", so it is
-  ## restricted to the characters every §4 identifier is spelled with, and
-  ## may not begin with `.` (dot-names under ``v1/`` are never content,
-  ## Transport §2.5). Nor may it be a name Windows does not store as
-  ## spelled: one ending in `.` (the dot is dropped, so `a.` and `a` would
-  ## be one directory) or a reserved device name such as `CON` or `nul.x`,
-  ## which opens the device instead of a directory
-  ## (https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file).
-  if name.len == 0 or name.len > 128 or name[0] == '.' or name[^1] == '.':
-    return false
-  for c in name:
-    if c notin {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '-', '_', '.'}:
-      return false
-  let stem = name.split('.')[0].toUpperAscii
-  if stem in ["CON", "PRN", "AUX", "NUL"]:
-    return false
-  if stem.len == 4 and stem[0 .. 2] in ["COM", "LPT"] and stem[3] in {'0' .. '9'}:
-    return false
-  true
 
 # ---------------------------------------------------------------------------
 # manifest-v1-sha256 (Content-Id §4.2)

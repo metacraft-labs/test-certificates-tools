@@ -18,6 +18,8 @@
 ##   parsed and re-serialized, byte-compared with ``canonical.txt``.
 ## * ``verify/unknown-keys``: every malformed record is refused before naming,
 ##   including unknown claims in the excluded signature block (Standard §3.4).
+## * ``verify/content-algorithm-name``: every non-portable prefix is malformed
+##   before store naming, with no vector ignored.
 ## * ``notes/``: ``note.txt`` split per Transport §3.1 and every piece
 ##   compared with ``expected.json``; for a writer case ``add.txt`` added and
 ##   the blob byte-compared with ``expected-note.txt`` (notes_framing_vectors).
@@ -276,7 +278,7 @@ suite "conformance vectors":
     # Every case Conformance §5 and §3 require is present.
     for required in [
       "unsigned", "signed", "signed-non-canonical", "signed-non-canonical-no-block",
-      "manifest-content", "scoped",
+      "manifest-content", "scoped", "unknown-algorithm",
     ]:
       check dirExists(vectors / "store" / required)
     for required in [
@@ -321,6 +323,30 @@ suite "conformance vectors":
     present.sort()
     check checked == present
     check checked.len == 7
+
+  test "algorithm identifier rejection vectors cannot name store directories":
+    let vectors = pinnedVectors()
+    defer:
+      cleanup(vectors.parentDir)
+    let dir = vectors / "verify" / "content-algorithm-name"
+    let expected = parseJson(readFile(dir / "expected.json"))
+    check expected["outcome"].getStr == "not-covered"
+    var checked, present: seq[string]
+    for rejected in expected["rejected"]:
+      let name = rejected["certificate"].getStr
+      checkpoint name
+      let parsed = parseCertificate(readFile(dir / "certificates" / name))
+      require parsed.ok
+      check parseContentId(parsed.certificate.content).form == cifMalformed
+      check not storeNameOf(parsed.certificate).ok
+      checked.add name
+    for kind, path in walkDir(dir / "certificates"):
+      if kind == pcFile:
+        present.add path.extractFilename
+    checked.sort()
+    present.sort()
+    check checked == present
+    check checked.len == 19
 
   test "notes_framing_vectors":
     let vectors = pinnedVectors()

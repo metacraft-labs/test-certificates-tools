@@ -16,7 +16,12 @@ are described here.
 
 `<algorithm>:<digest>` is the certificate's content id, split at its first
 `:`; `<payload-hash>` is the SHA-256 of the certificate's canonical payload,
-rebuilt from its parsed fields. A user has two roots:
+rebuilt from its parsed fields. Algorithm identifiers contain 1–64 lowercase
+ASCII letters, digits or hyphens; `con`, `prn`, `aux`, `nul`, `com1`–`com9`
+and `lpt1`–`lpt9` are forbidden. Names outside this grammar are malformed on
+every platform.
+`put` and `find --content` accept well-formed ids in unknown algorithms
+verbatim, without computing the algorithm. A user has two roots:
 
 | Root   | Resolved from                                                                                                                                                                                                                                              |
 | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -75,8 +80,7 @@ written).
   because this release cannot preserve them safely. `prune --system` applies
   the same preconditions before deleting. `--system` is unsupported on Windows.
 - Refused, and nothing written: input that is not TOML, a schema other than
-  `test-certificate.v1`, a malformed `content` (or one whose algorithm
-  cannot be a directory name on every platform), a missing required field,
+  `test-certificate.v1`, a malformed `content`, a missing required field,
   a record with no target or no command, a field the schema does not define
   (an earlier-draft record's `commit`/`clean`, for instance), and a
   signature block with only one of `algorithm` and `value`.
