@@ -80,6 +80,34 @@ when not defined(windows):
   proc errorText(context: string): string =
     context & ": " & $strerror(errno)
 
+  const LockCreateAttempts = 200
+    ## With a 1 ms pause between attempts: far longer than the creation
+    ## race below lasts, and short enough to fail promptly if it does not end.
+
+  proc openLockFile(rootFd: cint, mode: cint): cint =
+    ## Open, creating it if missing, the root's persistent writer lock.
+    ## On macOS, when several writers create the same lock at once (the
+    ## first publishers into a new root), a losing ``open(O_CREAT)`` has been
+    ## seen to fail with ENOENT although the directory it names exists: CI
+    ## run 40879149840, two of sixteen concurrent publishers. ENOENT is
+    ## retried, but only while ``rootFd`` still names a directory that has
+    ## a name in the file system: a removed root is a real ENOENT and fails
+    ## at once. ``errno`` is that of the last ``openat`` on failure.
+    for attempt in 1 .. LockCreateAttempts:
+      result = openat(
+        rootFd,
+        ".write-lock",
+        O_RDWR or O_CREAT or O_NOFOLLOW or O_CLOEXEC or O_NONBLOCK,
+        mode,
+      )
+      if result >= 0 or errno != ENOENT or attempt == LockCreateAttempts:
+        return
+      var st: Stat
+      if fstat(rootFd, st) != 0 or st.st_nlink == 0:
+        errno = ENOENT
+        return
+      sleep(1)
+
   proc flock(fd, operation: cint): cint {.importc, header: "<sys/file.h>".}
 
   proc closeFd(fd: cint) =
@@ -250,12 +278,7 @@ when not defined(windows):
           return
       # Every writer, including a signer, locks this persistent root file.
       # Never unlink it: waiters must continue to name the same inode.
-      let lockFd = openat(
-        rootFd,
-        ".write-lock",
-        O_RDWR or O_CREAT or O_NOFOLLOW or O_CLOEXEC or O_NONBLOCK,
-        cint(opened.policy.fileMode),
-      )
+      let lockFd = openLockFile(rootFd, cint(opened.policy.fileMode))
       if lockFd < 0:
         result.problem = errorText("could not open the store writer lock")
         return
