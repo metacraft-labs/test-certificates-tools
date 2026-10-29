@@ -7,7 +7,8 @@
 ## on Linux this test binary runs as root — and gets there without sudo:
 ##
 ## 1. Already root: it runs as it is.
-## 2. Otherwise it re-executes itself in a new user namespace
+## 2. Otherwise, if a probe there can give a file to ``nobody``, it
+##    re-executes itself in a new user namespace
 ##    (``unshare --user --map-root-user --map-users=auto --map-groups=auto``,
 ##    util-linux, from the dev shell). There it is root over this account's
 ##    subordinate uid and gid ranges (``/etc/subuid``, ``/etc/subgid``, set up
@@ -60,11 +61,31 @@ when defined(linux):
     let self = getAppFilename()
     let params = commandLineParams()
     var tried: seq[string]
-    let probe = runProcess("unshare", @NamespaceArgs & @["true"], getCurrentDir())
+    # The probe must do what the fixtures do: give a file to `nobody`. A
+    # namespace can be created yet map no subordinate ids (no /etc/subuid
+    # entry for this account, as on GitHub's Linux runners), and then every
+    # chown to a second account fails with EPERM inside it.
+    let nobody = getpwnam("nobody")
+    let owner =
+      if nobody == nil:
+        "65534:65534"
+      else:
+        $nobody.pw_uid & ":" & $nobody.pw_gid
+    let probe = runProcess(
+      "unshare",
+      @NamespaceArgs &
+        @[
+          "sh", "-c",
+          "f=$(mktemp) || exit 1; chown \"$0\" \"$f\"; s=$?; rm -f \"$f\"; exit $s",
+          owner,
+        ],
+      getCurrentDir(),
+    )
     if probe.started and probe.exitCode == 0:
       putEnv(PrivilegedMarker, "1")
       reexecAs("unshare", @NamespaceArgs & @[self] & params)
-    tried.add "a user namespace (`unshare " & NamespaceArgs.join(" ") & " true`): " &
+    tried.add "a user namespace (`unshare " & NamespaceArgs.join(" ") &
+      " sh -c <chown a file to nobody>`): " &
       (if probe.started: probe.stderr.strip() else: probe.failure)
     let sudo = runProcess("sudo", ["-n", "true"], getCurrentDir())
     if sudo.started and sudo.exitCode == 0:
