@@ -45,13 +45,25 @@ static int tcert_recipient_bits(unsigned int uid, unsigned int gid, unsigned int
   if (uid == 0) return 7;
   struct passwd *pw = getpwuid((uid_t)uid);
   if (!pw) return -1;
-  int count = 0;
-  getgrouplist(pw->pw_name, pw->pw_gid, NULL, &count);
-  if (count <= 0) return -1;
-  gid_t *groups = malloc(sizeof(gid_t) * (size_t)count);
+  /* Ask with a buffer and grow it on -1. Sizing it first with a NULL buffer
+     relies on glibc reporting the count needed; the BSD/Darwin page does
+     not promise it.
+     https://man7.org/linux/man-pages/man3/getgrouplist.3.html */
+  int count = 64;
+  gid_t *groups = NULL;
+  for (int tries = 0; tries < 8 && !groups; ++tries) {
+    groups = malloc(sizeof(gid_t) * (size_t)count);
+    if (!groups) return -1;
+    int n = count;
+    if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &n) >= 0) {
+      count = n;
+    } else {
+      free(groups);
+      groups = NULL;
+      count = n > count ? n : count * 2;
+    }
+  }
   if (!groups) return -1;
-  int n = getgrouplist(pw->pw_name, pw->pw_gid, groups, &count);
-  if (n < 0) { free(groups); return -1; }
   int member = 0;
   for (int i = 0; i < count; ++i) if (groups[i] == (gid_t)gid) member = 1;
   free(groups);
