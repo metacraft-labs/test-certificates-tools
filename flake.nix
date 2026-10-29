@@ -179,7 +179,13 @@
               pkgs.coreutils
               pkgs.nixfmt
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.acl ]
+            # acl: `setfacl` for the ACL fixtures. util-linux: `unshare` and
+            # `setpriv`, with which the permission tests become root in a user
+            # namespace and act as a second account (tests/t_permissions.nim).
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.acl
+              pkgs.util-linux
+            ]
             ++ config.pre-commit.settings.enabledPackages
             ++ [ config.pre-commit.settings.package ];
           };
