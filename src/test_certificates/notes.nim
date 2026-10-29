@@ -47,7 +47,7 @@
 ## failing.
 
 import std/[algorithm, os, random, sequtils, sets, strutils, tables, times]
-import ./[git, certificate, content_id, content_state, find, put, roots, layout]
+import ./[git, certificate, content_id, content_state, find, put, roots, layout, scopes]
 import ./note_framing
 
 export note_framing
@@ -84,6 +84,10 @@ type
   PublishedTree* = object ## What ``notes publish`` did for one tree.
     commits*: seq[string] ## The commits (as given, resolved) whose tree it is.
     tree*: string
+    scope*: seq[string]
+      ## The declared scope (Tooling §3.1) this is the commits' scoped tree
+      ## in; empty for the commits' own tree. A tree that is both is reported
+      ## once, for the first.
     contentId*: string
     appended*, replaced*, present*: seq[string]
       ## Payload hashes, by what happened to them.
@@ -105,6 +109,7 @@ type
   ImportedTree* = object
     commit*: string
     tree*: string
+    scope*: seq[string] ## As ``PublishedTree.scope``.
     contentId*: string
     hasNote*: bool
     stored*: seq[ImportedRecord]
@@ -426,6 +431,37 @@ proc treeOf(r: NotesRepo, commit: string): tuple[ok: bool, tree, problem: string
     return (false, "", "the tree of " & commit & " cannot be resolved")
   (true, tree, "")
 
+type CommitTree = tuple[commit, tree: string, scope: seq[string]]
+
+proc treesOfCommits(
+    r: NotesRepo, commits: openArray[string]
+): tuple[ok: bool, trees: seq[CommitTree], problems: seq[string]] =
+  ## Every tree of every commit (Tooling §3.1): its own tree, then its scoped
+  ## tree in each scope the repository declares, commit by commit. A
+  ## declaration that is invalid fails the whole call, before anything is
+  ## written: publishing the rest would hide the error.
+  let declared = declaredScopes(r.dir)
+  if not declared.ok:
+    for p in declared.problems:
+      result.problems.add "invalid scope declaration: " & p
+    return
+  var own: seq[string]
+  for commit in commits:
+    let t = treeOf(r, commit)
+    if not t.ok:
+      result.problems.add t.problem
+      return
+    own.add t.tree
+  let scoped = scopedTrees(r.dir, r.hexLen, own, declared.scopes)
+  if not scoped.ok:
+    result.problems.add scoped.problem
+    return
+  for i, commit in commits:
+    result.trees.add (commit, own[i], newSeq[string]())
+    for j, s in declared.scopes:
+      result.trees.add (commit, scoped.trees[own[i]][j], s.paths)
+  result.ok = true
+
 # ---------------------------------------------------------------------------
 # notes publish
 # ---------------------------------------------------------------------------
@@ -438,10 +474,12 @@ proc publishNotes*(
     attempts = DefaultAttempts,
 ): PublishReport =
   ## Tooling §3 ``notes publish``: for each commit, the store's certificates
-  ## for ``<commit>^{tree}`` (both roots, Transport §2.4) are added to the
-  ## note on that tree in the LOCAL notes ref, in §3.1 record form, by the
-  ## §3.1 writer rule (``addRecord``). Publishing twice adds nothing; every
-  ## piece already in a note is kept.
+  ## for each of its trees — ``<commit>^{tree}`` and its scoped tree in every
+  ## declared scope (Tooling §3.1) — from both roots (Transport §2.4) are
+  ## added to the note on that tree in the LOCAL notes ref, in §3.1 record
+  ## form, by the §3.1 writer rule (``addRecord``). Publishing twice adds
+  ## nothing; every piece already in a note is kept. An invalid scope
+  ## declaration is reported and nothing is written.
   let r = openNotesRepo(dir, notesRef)
   if not r.ok:
     result.problems.add r.problem
@@ -455,22 +493,26 @@ proc publishNotes*(
     result.problems.add "the revisions select no commits"
     result.ok = true
     return
+  let all = treesOfCommits(r, resolved.commits)
+  if not all.ok:
+    result.problems.add all.problems
+    return
   # Group by tree: one note serves every commit with that tree.
   var order: seq[string]
   var byTree = initTable[string, int]()
   var records = initTable[string, seq[NotePiece]]()
-  for commit in resolved.commits:
-    let t = treeOf(r, commit)
-    if not t.ok:
-      result.problems.add t.problem
-      return
-    if t.tree in byTree:
-      result.trees[byTree[t.tree]].commits.add commit
+  for (commit, tree, scope) in all.trees:
+    if tree in byTree:
+      if commit notin result.trees[byTree[tree]].commits:
+        result.trees[byTree[tree]].commits.add commit
       continue
-    byTree[t.tree] = result.trees.len
-    order.add t.tree
+    byTree[tree] = result.trees.len
+    order.add tree
     var published = PublishedTree(
-      commits: @[commit], tree: t.tree, contentId: formatContentId(r.algorithm, t.tree)
+      commits: @[commit],
+      tree: tree,
+      scope: scope,
+      contentId: formatContentId(r.algorithm, tree),
     )
     let found = findById(roots, published.contentId)
     published.searchProblems = found.problems
@@ -499,7 +541,7 @@ proc publishNotes*(
           ": its canonical record does not parse back: " & piece.problem
         continue
       pieces.add piece
-    records[t.tree] = pieces
+    records[tree] = pieces
     result.trees.add published
 
   for attempt in 1 .. max(attempts, 1):
@@ -581,8 +623,9 @@ proc importNotes*(
     notesRef = "",
 ): ImportReport =
   ## Tooling §3 ``notes import``: the records in the notes on each commit's
-  ## tree, written into ``userRoot`` through ``putCertificate`` (Transport
-  ## §2.3). A piece that is leading text, does not parse, names another
+  ## trees — its own and its scoped tree in every declared scope (Tooling
+  ## §3.1) — written into ``userRoot`` through ``putCertificate`` (Transport
+  ## §2.3). An invalid scope declaration is reported and nothing is stored. A piece that is leading text, does not parse, names another
   ## content (misattached, Transport §3) or is refused by ``put`` is reported
   ## in its tree's ``faults`` and never stops the others.
   let r = openNotesRepo(dir, notesRef)
@@ -602,6 +645,10 @@ proc importNotes*(
   if not resolved.ok:
     result.problems.add resolved.problem
     return
+  let all = treesOfCommits(r, resolved.commits)
+  if not all.ok:
+    result.problems.add all.problems
+    return
   let current = refValue(r, r.notesRef)
   if not current.ok:
     result.problems.add current.problem
@@ -612,22 +659,20 @@ proc importNotes*(
     return
   var failed = false
   var done: HashSet[string]
-  for commit in resolved.commits:
-    let t = treeOf(r, commit)
-    if not t.ok:
-      result.problems.add t.problem
-      failed = true
-      continue
-    if done.containsOrIncl(t.tree):
+  for (commit, tree, scope) in all.trees:
+    if done.containsOrIncl(tree):
       continue
     var imported = ImportedTree(
-      commit: commit, tree: t.tree, contentId: formatContentId(r.algorithm, t.tree)
+      commit: commit,
+      tree: tree,
+      scope: scope,
+      contentId: formatContentId(r.algorithm, tree),
     )
-    if t.tree notin notes.tree:
+    if tree notin notes.tree:
       result.trees.add imported
       continue
     imported.hasNote = true
-    let blob = readBlob(r, notes.tree[t.tree].blob)
+    let blob = readBlob(r, notes.tree[tree].blob)
     if not blob.ok:
       result.problems.add blob.problem
       failed = true

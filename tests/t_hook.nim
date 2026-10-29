@@ -12,8 +12,10 @@
 ##   imports and finds.
 ## * Deletions, tags (of a commit, of a tree), a new branch, a remote object
 ##   this clone never fetched, a push to a URL with no configured remote, a
-##   user's ``notes push`` (the hook runs once and does not push again), the
-##   opt-out variable, and ``hook install`` never replacing a hook.
+##   user's ``notes push`` (the hook runs once and does not push again), two
+##   refs whose remote objects bound each other's introduced commits, a
+##   budget that would be unlimited, the opt-out variable, and ``hook
+##   install`` never replacing a hook. Declared scopes: ``t_scopes``.
 ##
 ## Most hooks here are a two-line script that counts its invocations and
 ## then execs the built binary by absolute path, so the count observes
@@ -172,6 +174,7 @@ suite "hook pre-push":
     check runs(counter) == 1
     check "test-certificates:" notin deleted.stderr
     check git(remote, ["rev-parse", "--verify", "--quiet", Ref]).ok == false
+    check git(a.dir, ["rev-parse", "--verify", "--quiet", Ref]).ok == false
     # A tag of a tree is not a commit.
     discard gitIn(a.dir, ["tag", "tree-tag", tree])
     let tagged = push(a, "origin", "refs/tags/tree-tag")
@@ -194,6 +197,34 @@ suite "hook pre-push":
     checkpoint release.stderr
     check release.exitCode == 0
     check remoteKeys(remote) == toHashSet([t2])
+
+  test "the other refs' remote objects bound what each ref introduces":
+    # Pushed to a URL, so there are no remote-tracking refs: only the remote
+    # object of `main`, pushed alongside, keeps the new branch from
+    # introducing its whole history (Tooling §4.2, exclusion 1).
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    var a = Clone(dir: scratch / "a", store: scratch / "a-store")
+    a.env = isolatedEnv(scratch, a.store)
+    createDir(a.dir)
+    discard gitIn(a.dir, ["init", "-q", "-b", "main"])
+    let base = commitFile(a, "f", "base\n")
+    check push(a, "-q", remote, "main").exitCode == 0
+    discard installCountingHook(a, scratch)
+    certify(a, base) # On the remote, under main.
+    let onMain = commitFile(a, "f", "main\n")
+    certify(a, onMain)
+    discard gitIn(a.dir, ["checkout", "-q", "-b", "topic", "HEAD~1"])
+    let onTopic = commitFile(a, "f", "topic\n")
+    certify(a, onTopic)
+    let both = push(a, remote, "main", "topic")
+    checkpoint both.stderr
+    check both.exitCode == 0
+    check "2 certified tree(s) among 2 pushed commit(s)" in both.stderr
+    check remoteKeys(remote) == toHashSet([onMain, onTopic])
+    check base notin noteKeys(a.dir)
 
   test "a push to a URL pushes the notes to that URL":
     let scratch = scratchDir()
@@ -332,11 +363,21 @@ suite "hook pre-push":
     discard gitIn(a.dir, ["config", "--unset", NotesRefConfigKey])
     check hookDirect(a, line, ["nowhere", "nowhere"]).exitCode == 0
 
+    # A budget that is not a whole number of seconds of at least 1 — "no
+    # limit" included — is reported and the default used (Tooling §4.3).
+    for value in ["0", "-1", "soon"]:
+      let ignored = hookDirect(
+        a, line, [remote, remote], [("TEST_CERTIFICATES_HOOK_TIMEOUT", value)]
+      )
+      check ignored.exitCode == 0
+      check ("ignored TEST_CERTIFICATES_HOOK_TIMEOUT=" & value) in ignored.errors
+
     # Opted out: says so, touches nothing.
     let t2 = commitFile(a, "f", "y\n")
     certify(a, t2)
     check push(a, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
     let before = remoteKeys(remote)
+    let localBefore = gitIn(a.dir, ["rev-parse", Ref]).strip()
     let t3 = commitFile(a, "f", "z\n")
     certify(a, t3)
     let optedOut = gitWith(
@@ -348,6 +389,7 @@ suite "hook pre-push":
     check "TEST_CERTIFICATES_HOOK=off" in optedOut.stderr
     check remoteKeys(remote) == before
     check t3 notin before
+    check gitIn(a.dir, ["rev-parse", Ref]).strip() == localBefore
 
   test "receiving_side_finds_certificates_after_a_plain_git_push":
     let scratch = scratchDir()

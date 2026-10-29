@@ -13,8 +13,9 @@
 ## object name. See githooks(5), "pre-push":
 ## https://git-scm.com/docs/githooks#_pre_push
 ##
-## **What a push introduces.** For each pushed ref, the commits reachable
-## from the local object and not from what the remote is known to have:
+## **What a push introduces** (Tooling §4.2). For each pushed ref, the
+## commits reachable from the local object and not from what the remote is
+## known to have:
 ##
 ## * the remote's current object, when this repository has it
 ##   (``<remote>..<local>``, exactly what git will send for that ref);
@@ -36,12 +37,16 @@
 ## notes ref again from inside it would race the very push that started it;
 ## and an object that is not a commit (a tag of a tree or a blob).
 ##
-## **Pushing.** Only when some introduced commit's tree has certificates in
-## the store, to the remote's NAME when there is one (so its configured push
+## **What is published** (Tooling §3.1). Each introduced commit's own tree
+## and its scoped tree in every scope the repository declares
+## (``scopes``); an invalid declaration is reported and stops propagation.
+##
+## **Pushing** (Tooling §4.3). Only when one of those trees has certificates
+## in the store, to the remote's NAME when there is one (so its configured push
 ## URL is used) and otherwise to the URL, through ``pushNotes`` with
 ## ``runHooks = false`` (``git push --no-verify``) so the hook does not
-## re-enter itself, and within a time budget (``HookOptions.push.timeoutMs``)
-## so an unresponsive remote cannot hold the user's push. With no
+## re-enter itself, and within a time budget (``HookOptions.push.timeoutMs``,
+## always finite) so an unresponsive remote cannot hold the user's push. With no
 ## certificates to carry, no network operation is made at all.
 ##
 ## **Never failing.** ``prePushHook`` returns a report; nothing in it is a
@@ -50,10 +55,13 @@
 ## (Tooling §4).
 
 import std/[os, sets, strutils, tables]
-import ./[git, content_id, layout, roots, notes]
+import ./[git, content_id, layout, roots, notes, scopes]
 
 const
   NotesRefPrefix* = "refs/notes/"
+  DefaultHookTimeoutMs* = 60_000
+    ## The hook's network time budget unless the caller gives another. There
+    ## is no unlimited budget (Tooling §4.3): a non-positive one means this.
   PrePushHookScript* = """#!/bin/sh
 # pre-push: carry test certificates with every push, as git notes.
 # Installed by `test-certificates hook install`. It never fails the push:
@@ -81,7 +89,10 @@ type
     faults*: seq[string] ## Lines that could not be read, and why.
 
   HookOptions* = object
-    push*: PushOptions ## For the notes push. ``runHooks`` is always forced off.
+    push*: PushOptions
+      ## For the notes push. ``runHooks`` is always forced off, and a
+      ## ``timeoutMs`` that is not positive is replaced by
+      ## ``DefaultHookTimeoutMs``: the budget is always finite.
 
   HookReport* = object ## What the hook did. Nothing here fails the push.
     target*: string ## Where the notes ref is pushed: the remote's name, else its URL.
@@ -90,8 +101,9 @@ type
     skipped*: seq[string] ## Pushed refs left alone, and why.
     introduced*: seq[string] ## Every commit the push introduces, once each.
     certified*: seq[string]
-      ## Of those, one commit per tree that has a content directory in the
-      ## store: what is published.
+      ## Of those, the commits with a tree — their own, or their scoped tree
+      ## in a declared scope (Tooling §3.1) — that has a content directory in
+      ## the store and that no earlier commit here shares: what is published.
     published*: PublishReport
     publishRan*: bool
     pushed*: SyncReport
@@ -106,7 +118,7 @@ proc defaultHookOptions*(): HookOptions =
   ## The default push options, with hooks off and a 60 s budget.
   result.push = defaultPushOptions()
   result.push.runHooks = false
-  result.push.timeoutMs = 60_000
+  result.push.timeoutMs = DefaultHookTimeoutMs
 
 proc isObjectName(s: string): bool =
   s.len in [40, 64] and s.allCharsInSet({'0' .. '9', 'a' .. 'f'})
@@ -280,6 +292,24 @@ proc prePushHook*(
   if result.introduced.len == 0:
     return
 
+  # The trees certificates are published on (Tooling §3.1): each introduced
+  # tree, and its scoped tree in every declared scope. An invalid
+  # declaration stops propagation, reported, as `notes publish` stops.
+  let declared = declaredScopes(dir)
+  if not declared.ok:
+    for p in declared.problems:
+      result.problems.add "invalid scope declaration: " & p
+    result.propagated = false
+    return
+  var ownTrees: seq[string]
+  for tree in byTree.keys:
+    ownTrees.add tree
+  let scoped = scopedTrees(dir, repo.hexLen, ownTrees, declared.scopes)
+  if not scoped.ok:
+    result.problems.add scoped.problem
+    result.propagated = false
+    return
+
   let stored = storedDigests(roots, repo.algorithm)
   result.problems.add stored.problems
   if stored.problems.len > 0:
@@ -290,9 +320,17 @@ proc prePushHook*(
     result.problems.add "neither store root could be resolved"
     result.propagated = false
     return
+  var covered: HashSet[string] # Trees a selected commit already publishes.
   for tree, commit in byTree:
-    if tree in stored.digests:
+    let trees = @[tree] & scoped.trees[tree]
+    var wanted = false
+    for t in trees:
+      if t in stored.digests and t notin covered:
+        wanted = true
+    if wanted:
       result.certified.add commit
+      for t in trees:
+        covered.incl t
   if result.certified.len == 0:
     return
 
@@ -311,6 +349,8 @@ proc prePushHook*(
 
   var pushOptions = options.push
   pushOptions.runHooks = false
+  if pushOptions.timeoutMs <= 0:
+    pushOptions.timeoutMs = DefaultHookTimeoutMs
   result.pushRan = true
   result.pushed = pushNotes(dir, result.target, options = pushOptions)
   result.remarks.add result.pushed.remarks

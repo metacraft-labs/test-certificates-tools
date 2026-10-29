@@ -221,24 +221,26 @@ proc detectUnmerged(
     return (true, @[], "")
   (true, @[Refusal(condition: ncUnmerged, paths: paths)], "")
 
-proc blobDigests(
-    toplevel: string, objectIds: seq[string]
-): tuple[ok: bool, digests: seq[string], problem: string] =
-  ## The SHA-256 of each blob's content, in order.
+proc readObjects*(
+    toplevel: string, objectIds: openArray[string], kind: string
+): tuple[ok: bool, contents: seq[string], problem: string] =
+  ## The raw content of each object, in order, each required to be of type
+  ## ``kind`` (``blob``, ``tree``). One ``cat-file --batch`` for all of
+  ## them on POSIX; one ``cat-file <kind>`` each on Windows (see ``git``).
   if objectIds.len == 0:
     return (true, @[], "")
   when defined(windows):
     for oid in objectIds:
-      let blob = git(toplevel, ["cat-file", "blob", oid])
-      if not blob.ok:
-        return (false, @[], blob.failure)
-      result.digests.add sha256Hex(blob.stdout)
+      let one = git(toplevel, ["cat-file", kind, oid])
+      if not one.ok:
+        return (false, @[], one.failure)
+      result.contents.add one.stdout
     result.ok = true
   else:
     # `cat-file --batch`: for each requested id, `<oid> SP <type> SP <size>
     # LF <content> LF` (git-cat-file(1), "BATCH OUTPUT").
     let batch =
-      git(toplevel, ["cat-file", "--batch"], input = objectIds.join("\n") & "\n")
+      git(toplevel, ["cat-file", "--batch"], input = @objectIds.join("\n") & "\n")
     if not batch.ok:
       return (false, @[], batch.failure)
     var at = 0
@@ -248,7 +250,7 @@ proc blobDigests(
       if lineEnd < 0:
         return (false, @[], "`git cat-file --batch` ended early")
       let header = output[at ..< lineEnd].split(' ')
-      if header.len != 3 or header[0] != oid or header[1] != "blob":
+      if header.len != 3 or header[0] != oid or header[1] != kind:
         return (
           false,
           @[],
@@ -262,9 +264,20 @@ proc blobDigests(
       let start = lineEnd + 1
       if start + size + 1 > output.len or output[start + size] != '\n':
         return (false, @[], "`git cat-file --batch` output is truncated")
-      result.digests.add sha256Hex(output.toOpenArray(start, start + size - 1))
+      result.contents.add output[start ..< start + size]
       at = start + size + 1
     result.ok = true
+
+proc blobDigests(
+    toplevel: string, objectIds: seq[string]
+): tuple[ok: bool, digests: seq[string], problem: string] =
+  ## The SHA-256 of each blob's content, in order.
+  let read = readObjects(toplevel, objectIds, "blob")
+  if not read.ok:
+    return (false, @[], read.problem)
+  for content in read.contents:
+    result.digests.add sha256Hex(content)
+  result.ok = true
 
 proc manifestOfTree(toplevel, tree: string): tuple[ok: bool, digest, problem: string] =
   ## ``manifest-v1-sha256`` of a tree holding exactly the in-scope entries at
@@ -306,6 +319,37 @@ proc manifestOfTree(toplevel, tree: string): tuple[ok: bool, digest, problem: st
   for i, at in blobAt:
     entries[at].contentSha256 = read.digests[i]
   manifestDigest(entries)
+
+proc scopedTreeOf*(
+    toplevel, tree: string, scope: openArray[string], indexFile: string
+): tuple[ok: bool, tree, problem: string] =
+  ## Content-Id §4.1, "Scoped": the tree holding the in-scope entries of
+  ## ``tree`` at their FULL paths, selected with literal pathspecs, built in
+  ## ``indexFile`` (a path that does not exist yet; it is left behind for
+  ## the caller to remove with its directory). ``scope`` is not validated
+  ## here: callers check every path with ``scopePathProblem`` first.
+  let empty = git(toplevel, ["read-tree", "--empty"], indexFile)
+  if not empty.ok:
+    return (false, "", empty.failure)
+  let listing = git(
+    toplevel,
+    @["--literal-pathspecs", "ls-tree", "-r", "-z", "--full-tree", tree, "--"] & @scope,
+  )
+  if not listing.ok:
+    return (false, "", listing.failure)
+  if listing.stdout.len > 0:
+    let info = git(
+      toplevel,
+      ["update-index", "-z", "--index-info"],
+      indexFile,
+      input = listing.stdout,
+    )
+    if not info.ok:
+      return (false, "", info.failure)
+  let written = git(toplevel, ["write-tree"], indexFile)
+  if not written.ok:
+    return (false, "", written.failure)
+  (true, singleLine(written.stdout), "")
 
 proc computeImpl(
     repository: string,
@@ -432,32 +476,10 @@ proc computeImpl(
       )
 
     if scope.len > 0:
-      # Content-Id §4.1, "Scoped": the in-scope entries of T at their FULL
-      # paths, selected with literal pathspecs, in a second empty index.
-      let scopedIndex = scratch / "scoped-index"
-      let empty = git(toplevel, ["read-tree", "--empty"], scopedIndex)
-      if not empty.ok:
-        return failed(empty.failure)
-      let listing = git(
-        toplevel,
-        @["--literal-pathspecs", "ls-tree", "-r", "-z", "--full-tree", tree, "--"] &
-          @scope,
-      )
-      if not listing.ok:
-        return failed(listing.failure)
-      if listing.stdout.len > 0:
-        let info = git(
-          toplevel,
-          ["update-index", "-z", "--index-info"],
-          scopedIndex,
-          input = listing.stdout,
-        )
-        if not info.ok:
-          return failed(info.failure)
-      let written = git(toplevel, ["write-tree"], scopedIndex)
-      if not written.ok:
-        return failed(written.failure)
-      tree = singleLine(written.stdout)
+      let scoped = scopedTreeOf(toplevel, tree, scope, scratch / "scoped-index")
+      if not scoped.ok:
+        return failed(scoped.problem)
+      tree = scoped.tree
       if not isObjectId(tree, treeAlgorithm):
         return failed(
           "git returned `" & tree & "` where a " & $treeAlgorithm &

@@ -10,23 +10,24 @@ them by section.
 
 ## Modules
 
-| Module          | Responsibility                                                                                                                                                 |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sha256`        | FIPS 180-4 SHA-256, streaming. The standard library has none and the package takes no dependencies.                                                            |
-| `toml`          | A strict TOML 1.0 reader. Accepts every rendering the conformance suite uses; refuses redefinitions and malformed text. Numbers and date-times are kept raw.   |
-| `content_id`    | Content-id form (Content-Id §1), never repaired; `manifest-v1-sha256` over explicit entries (§4.2).                                                            |
-| `certificate`   | Parse a record, rebuild its canonical payload (Canonical-Payload §2–§4), name it (Transport §2.2), tell signed from unsigned.                                  |
-| `git`           | Run git with stdout and stderr apart, servicing stdin and both outputs together so a large `cat-file --batch` cannot deadlock. No shell.                       |
-| `content_state` | The content id of a commit, the index being committed, or the working tree, in a temporary index (Content-Id §4.1, §5), with the §3 refusals.                  |
-| `roots`         | Root resolution (Transport §2.1) as a pure function of platform, environment and account; the uid or the Windows SID of this process.                          |
-| `layout`        | The naming conventions writers, readers and pruners share.                                                                                                     |
-| `put`           | The atomic writer (Transport §2.3), including the system-root no-follow writer and the retry after a prune.                                                    |
-| `find`          | Reading both roots (Transport §2.4) and the search report (§5).                                                                                                |
-| `prune`         | Rename-aside pruning (Transport §2.5).                                                                                                                         |
-| `note_framing`  | The note blob of Transport §3.1: split on delimiter lines, render byte for byte, the writer rule (`addRecord`), the union of two blobs (`mergeNotes`). No git. |
-| `notes`         | The notes carrier (Transport §3, Tooling §3): `publish`, `import`, `push`, `fetch`, the notes ref and its configuration, the union merge of two notes commits. |
-| `hook`          | The `pre-push` hook body (Tooling §4): git's hook input, the commits a push introduces, publish and push with hooks off and a time budget; `hook install`.     |
-| `cli`           | The command line as a library procedure (`runCli`); `src/test_certificates_cli.nim` is the three-line executable.                                              |
+| Module          | Responsibility                                                                                                                                                                                                                             |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `sha256`        | FIPS 180-4 SHA-256, streaming. The standard library has none and the package takes no dependencies.                                                                                                                                        |
+| `toml`          | A strict TOML 1.0 reader. Accepts every rendering the conformance suite uses; refuses redefinitions and malformed text. Numbers and date-times are kept raw.                                                                               |
+| `content_id`    | Content-id form (Content-Id §1), never repaired; `manifest-v1-sha256` over explicit entries (§4.2).                                                                                                                                        |
+| `certificate`   | Parse a record, rebuild its canonical payload (Canonical-Payload §2–§4), name it (Transport §2.2), tell signed from unsigned.                                                                                                              |
+| `git`           | Run git with stdout and stderr apart, servicing stdin and both outputs together so a large `cat-file --batch` cannot deadlock. No shell.                                                                                                   |
+| `content_state` | The content id of a commit, the index being committed, or the working tree, in a temporary index (Content-Id §4.1, §5), with the §3 refusals.                                                                                              |
+| `roots`         | Root resolution (Transport §2.1) as a pure function of platform, environment and account; the uid or the Windows SID of this process.                                                                                                      |
+| `layout`        | The naming conventions writers, readers and pruners share.                                                                                                                                                                                 |
+| `put`           | The atomic writer (Transport §2.3), including the system-root no-follow writer and the retry after a prune.                                                                                                                                |
+| `find`          | Reading both roots (Transport §2.4) and the search report (§5).                                                                                                                                                                            |
+| `prune`         | Rename-aside pruning (Transport §2.5).                                                                                                                                                                                                     |
+| `note_framing`  | The note blob of Transport §3.1: split on delimiter lines, render byte for byte, the writer rule (`addRecord`), the union of two blobs (`mergeNotes`). No git.                                                                             |
+| `scopes`        | The scopes a repository declares (Tooling §3.1) and the scoped trees of many trees at once: a batched tree walk finds the entries at each scope path, and each distinct in-scope content gets one scoped tree by `content_state`'s recipe. |
+| `notes`         | The notes carrier (Transport §3, Tooling §3): `publish`, `import`, `push`, `fetch`, the notes ref and its configuration, the union merge of two notes commits.                                                                             |
+| `hook`          | The `pre-push` hook body (Tooling §4): git's hook input, the commits a push introduces, publish (declared scopes included) and push with hooks off and a finite time budget; `hook install`.                                               |
+| `cli`           | The command line as a library procedure (`runCli`); `src/test_certificates_cli.nim` is the three-line executable.                                                                                                                          |
 
 Every operation returns a result object carrying its error; nothing raises to
 the caller, calls `quit`, or logs.
@@ -192,8 +193,11 @@ does over the network; `git.runProcess(timeoutMs)` stops a git that outlives
 it (SIGTERM, SIGKILL a second later) and does not wait for its pipes to
 close, because a remote helper it started (`ssh`, or `sleep` behind the
 tests' `ext::` remote) can hold them open after git is gone. A process that
-had already exited when the time ran out keeps its own answer. Windows drains
-its pipes blocking, so the budget is checked only between operations there.
+had already exited when the time ran out keeps its own answer. The hook's
+budget is always finite (Tooling §4.3): `prePushHook` replaces a non-positive
+one with `DefaultHookTimeoutMs`. Windows drains its pipes blocking, so the
+budget is checked only between operations there — which does not yet meet
+§4.3's bound for a single `git` that never returns.
 
 **Starting processes.** On POSIX, `git.runProcess` starts its child itself
 (`fork` and `execve`) rather than through Nim's `osproc.startProcess`. That

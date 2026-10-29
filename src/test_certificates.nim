@@ -30,9 +30,9 @@
 import
   test_certificates/[
     sha256, toml, content_id, certificate, content_state, roots, put, find, prune,
-    layout, note_framing, notes, hook,
+    layout, note_framing, notes, hook, scopes,
   ]
 
 export
   sha256, toml, content_id, certificate, content_state, roots, put, find, prune, layout,
-  note_framing, notes, hook
+  note_framing, notes, hook, scopes

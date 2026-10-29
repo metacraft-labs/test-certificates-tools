@@ -24,7 +24,7 @@
 ##   reported on standard error.
 
 import std/[os, sequtils, strutils]
-import ./[roots, put, find, prune, content_state, notes, hook]
+import ./[roots, put, find, prune, content_state, notes, hook, scopes]
 
 const
   Version* = block:
@@ -60,8 +60,11 @@ Commands:
   prune       Remove content directories beyond the newest n (default 20),
               protecting HEAD in native git-tree and manifest algorithms,
               unscoped and in each scope declared by a --paths group.
-  notes       Carry certificates in git notes on each commit's tree, in the
-              notes ref (git config testCertificates.notesRef, default
+  notes       Carry certificates in git notes on each commit's tree, and on
+              its scoped tree in every scope the repository declares
+              (git config testCertificatesScope.<name>.path, one path per
+              value, one section per scope), in the notes ref (git config
+              testCertificates.notesRef, default
               refs/notes/test-certificates/certificates):
                 publish  add the store's certificates to the local notes
                 import   copy noted certificates into the user root
@@ -73,7 +76,7 @@ Commands:
               arguments and standard input); publishes and pushes notes for
               the commits the push introduces and ALWAYS exits 0.
               TEST_CERTIFICATES_HOOK=off skips it; TEST_CERTIFICATES_HOOK_TIMEOUT
-              (seconds, default 60, 0 for none) bounds its network time.
+              (whole seconds, at least 1, default 60) bounds its network time.
               install: write it as this repository's pre-push hook, unless
               one exists; --print shows the hook instead.
 """
@@ -417,6 +420,13 @@ proc reportSync(io: CliIo, verb: string, r: SyncReport): int =
     io.output.say r.notesCommit
   0
 
+proc scopeNote(scope: seq[string]): string =
+  ## How a report line says which declared scope a tree is for.
+  if scope.len == 0:
+    ""
+  else:
+    " in scope " & scopeLabel(scope)
+
 proc notesCommand(io: CliIo, args: seq[string]): int =
   if args.len == 0:
     return usageError(io, "notes needs a subcommand: publish, import, push or fetch")
@@ -438,9 +448,9 @@ proc notesCommand(io: CliIo, args: seq[string]): int =
         io.output.say t.contentId & " " & h
       for h in t.replaced:
         io.output.say t.contentId & " " & h
-      io.errors.say t.contentId & " (" & t.commits.join(", ") & "): " & $t.appended.len &
-        " appended, " & $t.replaced.len & " replaced by a signed copy, " & $t.present.len &
-        " already present"
+      io.errors.say t.contentId & scopeNote(t.scope) & " (" & t.commits.join(", ") &
+        "): " & $t.appended.len & " appended, " & $t.replaced.len &
+        " replaced by a signed copy, " & $t.present.len & " already present"
     for remark in report.remarks:
       io.errors.say "note: " & remark
     for p in report.problems:
@@ -462,15 +472,15 @@ proc notesCommand(io: CliIo, args: seq[string]): int =
       for f in t.faults:
         io.errors.say "note: " & t.contentId & ": " & f
       if not t.hasNote:
-        io.errors.say t.contentId & " (" & t.commit & "): no note"
+        io.errors.say t.contentId & scopeNote(t.scope) & " (" & t.commit & "): no note"
       else:
         var kept = 0
         for s in t.stored:
           if s.kept:
             inc kept
-        io.errors.say t.contentId & " (" & t.commit & "): " & $t.stored.len &
-          " record(s) stored (" & $kept & " kept an existing file), " & $t.faults.len &
-          " skipped"
+        io.errors.say t.contentId & scopeNote(t.scope) & " (" & t.commit & "): " &
+          $t.stored.len & " record(s) stored (" & $kept & " kept an existing file), " &
+          $t.faults.len & " skipped"
     reportProblems(io, roots.problems)
     for p in report.problems:
       io.errors.say "test-certificates: " & p
@@ -494,8 +504,9 @@ const
     ## ``off`` (or ``0``, ``false``, ``no``) turns ``hook pre-push`` into a
     ## no-op that says so.
   HookTimeoutVariable* = "TEST_CERTIFICATES_HOOK_TIMEOUT"
-    ## Seconds the hook's network operations may take in all; 0 for no limit.
-  DefaultHookTimeoutSeconds* = 60
+    ## Whole seconds the hook's network operations may take in all, at least
+    ## 1. There is no "no limit" value (Tooling §4.3).
+  DefaultHookTimeoutSeconds* = DefaultHookTimeoutMs div 1000
 
 proc hookSay(io: CliIo, line: string) =
   io.errors.say "test-certificates: " & line
@@ -526,13 +537,14 @@ proc prePushCommand(io: CliIo, args: seq[string]): int =
   if timeoutText.len > 0:
     try:
       let seconds = parseInt(timeoutText)
-      if seconds < 0:
-        raise newException(ValueError, "negative")
+      if seconds < 1 or seconds > high(int32) div 1000:
+        raise newException(ValueError, "out of range")
       options.push.timeoutMs = seconds * 1000
     except ValueError:
       hookSay io,
         "note: ignored " & HookTimeoutVariable & "=" & timeoutText &
-          " (not a number of seconds); using " & $DefaultHookTimeoutSeconds
+          " (not a whole number of seconds, at least 1); using " &
+          $DefaultHookTimeoutSeconds
   let report =
     prePushHook(getCurrentDir(), args[0], args[1], input, nativeRoots(), options)
   for f in report.faults:

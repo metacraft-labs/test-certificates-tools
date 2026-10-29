@@ -217,15 +217,51 @@ The ref is `refs/notes/test-certificates/certificates`, or what
 `git config testCertificates.notesRef <ref>` sets for the repository. It must
 be a valid ref name under `refs/notes/`; anything else is refused.
 
+**Declared scopes.** A scoped certificate is keyed by its _scoped_ tree —
+the tree holding only the in-scope entries, at their full paths
+([Content-Id §4.1](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Content-Id.md#41-git-tree-sha1-and-git-tree-sha256))
+— and nobody can find it without knowing the scope. So the repository
+declares its scopes in git configuration, one section per scope and one
+literal path per `path` value
+([Tooling §3.1](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Tooling.md#31-declared-scopes)):
+
+```ini
+[testCertificatesScope "db"]
+    path = Cargo.lock
+    path = src/db-backend
+[testCertificatesScope "docs"]
+    path = docs
+```
+
+```sh
+git config --add testCertificatesScope.db.path Cargo.lock
+git config --add testCertificatesScope.db.path src/db-backend
+```
+
+That declares two scopes, `["Cargo.lock", "src/db-backend"]` and `["docs"]`
+— each section is one scope, exactly like one `--paths` group of `find` — and
+never `["src/db-backend"]` alone. Paths are literal (no globbing, no
+splitting) and must be scope paths: repo-relative, `/`-separated, no leading
+or trailing `/`, no empty, `.` or `..` component. The section name only
+appears in reports. A malformed path, a `path` with no value, or any other key
+under `testCertificatesScope` makes the declaration invalid: `notes publish`
+and `notes import` then report it and do nothing, and the hook reports it and
+lets the push go. git reads no configuration from the working tree; to keep
+the declaration under version control, commit it as a file and have each
+clone include it, e.g. `git config include.path ../.test-certificates-scopes`.
+
+A certificate for a scope that is not declared stays in the local store
+(`find --paths` finds it) and never travels.
+
 Every note holds its records in the framing of
 [Transport §3.1](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Transport.md#31-multiple-records-in-one-note):
 each record in canonical form (its canonical payload, then, when signed, a
 blank line and the signature table), preceded by the line
 `# --- test-certificate ---`.
 
-**`notes publish`** adds the store's certificates (both roots) for each
-commit's `<commit>^{tree}` to the note on that tree, in the **local** ref
-only. A revision containing `..` or `^-`, or ending in `^!` or `^@`, is a range; any
+**`notes publish`** adds the store's certificates (both roots) for each of a
+commit's trees — `<commit>^{tree}`, and its scoped tree in every declared
+scope — to the note on that tree, in the **local** ref only. A revision containing `..` or `^-`, or ending in `^!` or `^@`, is a range; any
 other names one commit. Publishing is idempotent: a record is identified by
 its payload hash, and a payload already in the note is not added again. A
 signed copy replaces an unsigned record of the same payload in place only
@@ -235,8 +271,9 @@ delimiter — is kept byte for byte. A store file that does not parse is
 reported and not published. Standard output lists `<content-id>
 <payload-hash>` for every record added or replaced.
 
-**`notes import`** copies the records in the notes on each commit's tree
-(default `HEAD`) into the user root, as `put` would. Text before the first
+**`notes import`** copies the records in the notes on each commit's trees
+(its own and, for every declared scope, its scoped tree; default `HEAD`) into
+the user root, as `put` would. Text before the first
 delimiter, a piece that does not parse, and a record whose `content` names
 another tree (misattached) are reported on standard error and skipped; the
 other records are still imported. Standard output lists the stored paths.
@@ -277,7 +314,10 @@ Library: `publishNotes(dir, roots, revisions): PublishReport`,
 `importNotes(dir, userRoot, revisions): ImportReport`,
 `pushNotes(dir, remote): SyncReport`, `fetchNotes(dir, remote): SyncReport`;
 the framing itself is `splitNote`, `renderNote`, `addRecord` and
-`mergeNotes`.
+`mergeNotes`; the declaration is `declaredScopes(dir): ScopeDeclaration` and
+the scoped trees of many trees at once `scopedTrees(dir, hexLen, trees,
+scopes): ScopedTrees`. `PublishedTree.scope` and `ImportedTree.scope` say
+which declared scope a tree is for (empty for a commit's own tree).
 
 ### `hook`
 
@@ -301,13 +341,20 @@ and retries included), then lets the push go on.
   could not be reached, the store could not be read — is reported on standard
   error as a `warning:`, with the command that retries it; the receiving gate
   decides what missing certificates mean.
-- **What a push introduces**, per pushed ref: the commits between the
-  remote's current value and the pushed one, when this clone has the remote's
-  value; otherwise (a new branch, or a remote value this clone never fetched)
-  the commits no remote-tracking ref of that remote reaches. A push to a URL
-  with no configured remote has no remote-tracking refs, so the pushed ref's
-  whole history is considered. Only commits whose tree has certificates in the
-  store are published, so that costs one `git rev-list`.
+- **What a push introduces**
+  ([Tooling §4.2](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Tooling.md#42-the-commits-a-push-introduces)),
+  per pushed ref: the commits between the remote's current value and the
+  pushed one, when this clone has the remote's value; otherwise (a new branch,
+  or a remote value this clone never fetched) the commits no remote-tracking
+  ref of that remote reaches. In every case, what the remote values of the
+  other refs in the same push reach is left out too. A push to a URL with no
+  configured remote has no remote-tracking refs, so the pushed ref's whole
+  history is considered. Only trees with certificates in the store are
+  published, so that costs one `git rev-list`, plus one tree walk per
+  component of the deepest declared scope path and a few commands per
+  distinct in-scope content.
+- **What it publishes:** each introduced commit's tree and its scoped tree in
+  every declared scope, as `notes publish` would.
 - **Left alone:** deletions; refs under `refs/notes/` (so your own `notes
 push`, or `git push origin refs/notes/…`, runs the hook without it pushing
   anything a second time); a tag of a tree or a blob. An annotated tag of a
@@ -321,11 +368,14 @@ push`, or `git push origin refs/notes/…`, runs the hook without it pushing
   re-enter itself. The library call is `prePushHook`, which passes
   `PushOptions.runHooks = false` to `pushNotes`.
 - **Bounded time.** Its network operations — every push attempt, the fetches
-  and backoff between them — share a budget of 60 seconds,
-  `TEST_CERTIFICATES_HOOK_TIMEOUT` (seconds; `0` for none) to change it. A
-  `git` still running when the budget is spent is stopped (SIGTERM, then
-  SIGKILL), reported, and the push goes on. Not on Windows, where the budget
-  is checked only between operations.
+  and backoff between them — share a budget of 60 seconds;
+  `TEST_CERTIFICATES_HOOK_TIMEOUT` (whole seconds, at least 1) changes it.
+  There is no unlimited setting
+  ([Tooling §4.3](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Tooling.md#43-publishing-pushing-and-the-time-budget)):
+  any other value is reported and the default used. A `git` still running
+  when the budget is spent is stopped (SIGTERM, then SIGKILL), reported, and
+  the push goes on. **Not yet on Windows**, where the budget is checked only
+  between operations, so one `git` that never returns still holds the push.
 - **Opting out of one push:** `TEST_CERTIFICATES_HOOK=off git push …` (also
   `0`, `false`, `no`). The hook says it skipped propagation. `git push
 --no-verify` skips every `pre-push` hook, this one included.
@@ -431,16 +481,17 @@ or `unreadable`.
 | The hook warned that certificates were not propagated                 | The warning names the failure. The local notes ref holds what was published; `test-certificates notes push <remote>` retries. A remote that refuses `refs/notes/*` (a server-side hook, branch protection on all refs) needs that permission.                                                                                                               |
 | The receiving side's `find --commit` says `absent`                    | Did the notes travel? `git ls-remote <remote> 'refs/notes/*'` on the remote; `test-certificates notes fetch <remote>` then `notes import <commit>` before `find`. Notes are never fetched by a plain `git fetch` or `git clone`.                                                                                                                            |
 | `notes import` reports `no note` for a commit whose push carried some | Both sides must use the same notes ref: `git config testCertificates.notesRef` (default `refs/notes/test-certificates/certificates`).                                                                                                                                                                                                                       |
+| A scoped certificate never reaches the receiving side                 | Its scope must be declared (`git config --get-regexp '^testcertificatesscope'`) on the pushing side to be published, and on the importing side to be imported. Each section is one scope: `src` and `lib` in one section is not the scope `src`.                                                                                                            |
 | `find` reports `unreadable`                                           | A permission problem, reported rather than read as "nothing found": fix the directory's permissions.                                                                                                                                                                                                                                                        |
 | The push takes as long as the time budget                             | The remote does not answer the notes push. Lower `TEST_CERTIFICATES_HOOK_TIMEOUT`, or opt out of the push with `TEST_CERTIFICATES_HOOK=off`.                                                                                                                                                                                                                |
 
 ## Environment
 
-| Variable                                                | Effect                                                                                |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `TEST_CERTIFICATES_DIR`                                 | The user root, when absolute.                                                         |
-| `TEST_CERTIFICATES_SYSTEM_DIR`                          | The directory holding every user's system partition, when absolute.                   |
-| `XDG_STATE_HOME`, `HOME`, `LOCALAPPDATA`, `ProgramData` | Platform defaults, as above.                                                          |
-| `GIT_INDEX_FILE`                                        | Honoured by `find --staged` (as git sets it during a commit).                         |
-| `TEST_CERTIFICATES_HOOK`                                | `off` (`0`, `false`, `no`): `hook pre-push` propagates nothing and says so.           |
-| `TEST_CERTIFICATES_HOOK_TIMEOUT`                        | Seconds the hook's network operations may take in all (default 60; `0` for no limit). |
+| Variable                                                | Effect                                                                                 |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `TEST_CERTIFICATES_DIR`                                 | The user root, when absolute.                                                          |
+| `TEST_CERTIFICATES_SYSTEM_DIR`                          | The directory holding every user's system partition, when absolute.                    |
+| `XDG_STATE_HOME`, `HOME`, `LOCALAPPDATA`, `ProgramData` | Platform defaults, as above.                                                           |
+| `GIT_INDEX_FILE`                                        | Honoured by `find --staged` (as git sets it during a commit).                          |
+| `TEST_CERTIFICATES_HOOK`                                | `off` (`0`, `false`, `no`): `hook pre-push` propagates nothing and says so.            |
+| `TEST_CERTIFICATES_HOOK_TIMEOUT`                        | Whole seconds, at least 1, the hook's network operations may take in all (default 60). |
