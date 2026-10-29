@@ -28,25 +28,30 @@ package is that plumbing, done once:
 - **`notes publish` / `import` / `push` / `fetch`** — carry certificates
   with a push in a git notes ref keyed by tree, and merge concurrent pushes
   as a union so no one's certificates are lost.
+- **`hook pre-push`** — a complete `pre-push` hook body: every push carries
+  the certificates for the commits it introduces, and never fails because of
+  them. `hook install` installs it where no hook exists yet.
 
 It does **not** verify, issue or sign certificates. `find` returns candidates;
 a framework's verifier judges them.
 
 ## Installation
 
-There are no binary releases yet. Build from source with Nim 2.2 or later:
+With Nix:
+
+```sh
+nix run github:metacraft-labs/test-certificates-tools -- --help
+nix profile install github:metacraft-labs/test-certificates-tools
+```
+
+From a [GitHub release](https://github.com/metacraft-labs/test-certificates-tools/releases),
+once one is published: archives for Linux x86_64 (also `.deb` and `.rpm`),
+macOS aarch64 and Windows x86_64. Or build from source with Nim 2.2 or later:
 
 ```sh
 git clone https://github.com/metacraft-labs/test-certificates-tools
 cd test-certificates-tools
 nim c -d:release -o:test-certificates src/test_certificates_cli.nim
-```
-
-or with Nix:
-
-```sh
-nix build github:metacraft-labs/test-certificates-tools
-./result/bin/test-certificates --help
 ```
 
 As a Nim library, put `src/` on the module path (or `nimble install`) and
@@ -75,6 +80,8 @@ $ test-certificates prune --keep 20
 $ test-certificates notes publish origin/main..HEAD   # store -> local notes ref
 $ test-certificates notes push origin                  # union-merges on a race
 $ test-certificates notes fetch origin && test-certificates notes import
+
+$ test-certificates hook install                      # every push carries them
 ```
 
 `find` prints candidate paths on standard output and what it searched on
@@ -108,6 +115,8 @@ caller, terminates the process or logs.
 - [User guide](./docs/users/README.md) — every command and library call.
 - [Contributor guide](./docs/contributors/architecture.md) — design, the
   races it handles, and how the tests are built.
+- [Releasing](./docs/contributors/releasing.md) — versioning and what a
+  `v<version>` tag publishes.
 - [AGENTS.md](./AGENTS.md) — build, test and lint commands.
 
 Licensed under the [Apache License, Version 2.0](./LICENSE).

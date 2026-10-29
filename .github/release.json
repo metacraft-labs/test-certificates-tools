@@ -1,0 +1,36 @@
+{
+  "product": "test-certificates",
+  "versionFile": "test_certificates.nimble",
+  "packageName": "metacraft-test-certificates",
+  "commands": ["test-certificates"],
+  "license": "Apache-2.0",
+  "summary": "Local store and git-notes propagation for test certificates",
+  "targets": [
+    {
+      "id": "linux-x86_64",
+      "runner": "eph-linux-x64-release",
+      "assets": [
+        "{product}-{version}-linux-x86_64.tar.gz",
+        "{product}-{version}-linux-x86_64.json",
+        "metacraft-test-certificates_{version}-1_amd64.deb",
+        "metacraft-test-certificates-{version}-1.x86_64.rpm"
+      ]
+    },
+    {
+      "id": "darwin-aarch64",
+      "runner": ["self-hosted", "macos", "arm64"],
+      "assets": [
+        "{product}-{version}-darwin-aarch64.tar.gz",
+        "{product}-{version}-darwin-aarch64.json"
+      ]
+    },
+    {
+      "id": "windows-x86_64",
+      "runner": ["self-hosted", "windows", "x64"],
+      "assets": [
+        "{product}-{version}-windows-x86_64.zip",
+        "{product}-{version}-windows-x86_64.json"
+      ]
+    }
+  ]
+}

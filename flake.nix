@@ -96,7 +96,9 @@
             };
           };
 
-          packages.default = pkgs.stdenv.mkDerivation {
+          packages.default = config.packages.test-certificates;
+
+          packages.test-certificates = pkgs.stdenv.mkDerivation {
             pname = "test-certificates";
             inherit version;
             src = ./.;
@@ -128,9 +130,39 @@
 
             meta = {
               description = "Reference helper tooling for the test-certificate standard";
+              homepage = "https://github.com/metacraft-labs/test-certificates-tools";
               license = pkgs.lib.licenses.asl20;
               mainProgram = "test-certificates";
             };
+          };
+
+          # `nix run github:metacraft-labs/test-certificates-tools -- <args>`.
+          apps.default = {
+            type = "app";
+            program = pkgs.lib.getExe config.packages.test-certificates;
+            meta.description = "Run the test-certificates command";
+          };
+
+          # `nix flake check` builds the package. Lint and tests need the sibling
+          # specification checkout and run through `just`, not as flake checks.
+          checks.package-build = config.packages.test-certificates;
+
+          # The release workflow (.github/workflows/release.yml) runs
+          # scripts/release/build.sh in this shell: the compiler, Node for the
+          # shared release tooling, and on Linux zig (a glibc 2.28 sysroot) and
+          # the ELF, .deb and .rpm packagers.
+          devShells.release = pkgs.mkShell {
+            packages = [
+              pkgs.nodejs
+              pkgs.nim2
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.zig
+              pkgs.patchelf
+              pkgs.binutils
+              pkgs.dpkg
+              pkgs.rpm
+            ];
           };
 
           devShells.default = pkgs.mkShell {

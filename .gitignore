@@ -17,3 +17,8 @@ nimcache/
 
 # CI-only checkout of the specification (.github/workflows/ci.yml).
 /.ci/
+
+# Release workflow outputs (scripts/release/build.sh, run by the shared
+# release tooling).
+/dist/
+/test-logs/
