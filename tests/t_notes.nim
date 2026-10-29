@@ -873,13 +873,15 @@ suite "note blobs":
       $t.toUnix() & align($t.nanosecond, 9, '0')
 
     # A process that has exited (its pid is not reused this quickly), and one
-    # that is still running (`git cat-file --batch` waits on its input).
+    # that is still running (`git cat-file --batch` waits on its input; it runs
+    # in the repository, since outside one it exits at once).
     let finished = startProcess("git", args = ["--version"], options = {poUsePath})
     let deadPid = finished.processID
     discard finished.waitForExit()
     finished.close()
-    let running =
-      startProcess("git", args = ["cat-file", "--batch"], options = {poUsePath})
+    let running = startProcess(
+      "git", workingDir = a.dir, args = ["cat-file", "--batch"], options = {poUsePath}
+    )
     defer:
       running.terminate()
       discard running.waitForExit()
