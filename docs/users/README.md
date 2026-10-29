@@ -182,12 +182,15 @@ each explicitly declared scope. Each `--paths` group is one scope: for example,
 `--paths src lib --paths tests` declares `["src", "lib"]` and `["tests"]`,
 without implicitly declaring `["src"]` or `["lib"]`. Paths are literal and
 repository-relative; `--` within a group makes its remaining paths literal
-arguments, including names starting with `-`. Scopes are never inferred from
-stored certificates. Protection is additional to the newest `n`, even at zero.
+arguments, including names starting with `-`. Every scope the repository
+declares for its certificates (`testCertificatesScope.<name>.path`, see
+[`notes`](#notes)) is protected too, exactly as if given as a `--paths`
+group. Scopes are never inferred from stored certificates. Protection is additional to the newest `n`, even at zero.
 
 All ids use one fixed `HEAD` tree, including in bare repositories; staged and
 working-tree changes do not affect them. Outside a repository or on an unborn
-branch there is no automatic protection. Explicit scopes without `HEAD`, or a
+branch there is no automatic protection, and the declared scopes are not
+read. Explicit scopes without `HEAD`, an invalid scope declaration, or a
 failure computing an id for an existing `HEAD`, abort before any deletion,
 including leftover cleanup. Never removes a directory a producer is writing into. Each directory is renamed
 aside to a `.`-prefixed name before it is deleted, so a writer racing the
@@ -195,8 +198,9 @@ prune retries safely; leftovers of an interrupted prune are deleted and never
 count as content. Prints each removed directory. Exit 0, or 1 when something
 could not be removed (reported), 2 on a usage error.
 
-Library: `headContentIds(repository, scopes): HeadContentIds` computes the
-complete protection set (check `ok` before pruning), then
+Library: `pruneProtection(repository, scopes): HeadContentIds` computes the
+complete protection set, declared scopes included (check `ok` before
+pruning; `headContentIds` is the same without the declared scopes), then
 `pruneRoot(root, keep, protectedIds, system = false): PruneResult` applies it.
 
 ### `notes`

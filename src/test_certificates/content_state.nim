@@ -540,7 +540,30 @@ type HeadContentIds* = object
   ## successful result means there is no repository or HEAD to protect.
   ok*: bool
   ids*: seq[string]
+  tree*: string
+    ## The frozen ``HEAD^{tree}`` object id every id was computed from; ""
+    ## when there is no repository or HEAD to protect.
   problem*: string
+
+proc addTreeContentIds*(
+    protection: var HeadContentIds, repository: string, scopes: openArray[seq[string]]
+): bool =
+  ## Adds to ``protection.ids`` the content ids of ``protection.tree`` in
+  ## each of ``scopes`` (``@[]`` for unscoped), in both computable
+  ## algorithms, each id once. On failure sets ``problem`` and returns
+  ## false; the ids added so far must then not be used.
+  for scope in scopes:
+    let native = computeContentId(repository, commitState(protection.tree), scope)
+    let manifest = computeContentId(
+      repository, commitState(protection.tree), caManifestV1Sha256, scope
+    )
+    for computed in [native, manifest]:
+      if computed.outcome != coComputed:
+        protection.problem = "cannot protect HEAD content: " & computed.problem
+        return false
+      if computed.id notin protection.ids:
+        protection.ids.add computed.id
+  true
 
 proc headContentIds*(
     repository: string, scopes: seq[seq[string]] = @[]
@@ -606,17 +629,9 @@ proc headContentIds*(
       if present.started and present.exitCode == 1 and scopes.len == 0:
         return HeadContentIds(ok: true)
     return HeadContentIds(problem: "cannot resolve HEAD tree: " & resolved.failure)
-  let tree = singleLine(resolved.stdout)
+  result.tree = singleLine(resolved.stdout)
   var allScopes: seq[seq[string]] = @[@[]]
   allScopes.add scopes
-  for scope in allScopes:
-    let native = computeContentId(repository, commitState(tree), scope)
-    let manifest =
-      computeContentId(repository, commitState(tree), caManifestV1Sha256, scope)
-    for computed in [native, manifest]:
-      if computed.outcome != coComputed:
-        return
-          HeadContentIds(problem: "cannot protect HEAD content: " & computed.problem)
-      if computed.id notin result.ids:
-        result.ids.add computed.id
+  if not addTreeContentIds(result, repository, allScopes):
+    return HeadContentIds(problem: result.problem)
   result.ok = true

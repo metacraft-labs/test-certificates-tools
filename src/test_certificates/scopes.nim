@@ -276,3 +276,28 @@ proc scopedTrees*(
         byContent[key] = built.tree
       perScope.add byContent[key]
     result.trees[root] = perScope
+
+proc pruneProtection*(
+    repository: string, explicit: seq[seq[string]] = @[]
+): HeadContentIds =
+  ## What ``prune`` keeps for ``repository`` (Tooling §2, Transport §2.5):
+  ## ``headContentIds`` for the unscoped state and every ``explicit`` scope,
+  ## plus every scope the repository declares (Tooling §3.1), all computed
+  ## from the same frozen ``HEAD`` tree in both algorithms. With no
+  ## repository or no ``HEAD`` there is nothing to protect and the
+  ## declaration is not read (outside a repository git would read only the
+  ## user's and the system's configuration). An invalid declaration is a
+  ## failure: pruning must then remove nothing.
+  result = headContentIds(repository, explicit)
+  if not result.ok or result.tree.len == 0:
+    return
+  let declared = declaredScopes(repository)
+  if not declared.ok:
+    return HeadContentIds(
+      problem: "invalid scope declaration: " & declared.problems.join("; ")
+    )
+  var more: seq[seq[string]]
+  for s in declared.scopes:
+    more.add s.paths
+  if not addTreeContentIds(result, repository, more):
+    return HeadContentIds(problem: result.problem)

@@ -2,6 +2,7 @@
 ## the built executable.
 ##
 ## * prune_keeps_newest_and_head_tree
+## * prune_protects_the_scopes_the_repository_declares — Tooling §3.1
 ## * prune_renames_aside_so_a_retrying_writer_survives — a writer and a
 ##   pruner interleaved at the points that matter, using the library's test
 ##   seams (``PutStepHook``, ``PruneStepHook``) to CHOOSE the interleaving.
@@ -189,6 +190,76 @@ suite "prune":
       check contentDirs(dir / "store") == expected
       check readFile(repo / ".git" / "index") == indexBefore
       check readFile(repo / "src") == "working tree\n"
+
+  test "prune_protects_the_scopes_the_repository_declares":
+    # Tooling §2 and §3.1, Transport §2.5: a scope the repository declares in
+    # git configuration is protected as a `--paths` group is, in both
+    # algorithms and from HEAD's tree; an undeclared scope (here a subset of
+    # a declared one) is not; and an invalid declaration aborts pruning
+    # before anything, leftovers included, is removed.
+    for format in ["sha1", "sha256"]:
+      let dir = scratchDir()
+      defer:
+        cleanup(dir)
+      let repo = newRepo(format)
+      defer:
+        cleanup(repo)
+      createDir(repo / "src")
+      for name in ["src/a b", "lib", "docs"]:
+        writeFile(repo / name, name & " committed\n")
+      commitAll(repo)
+      discard gitIn(repo, ["config", "--add", "testCertificatesScope.code.path", "src"])
+      discard gitIn(repo, ["config", "--add", "testCertificatesScope.code.path", "lib"])
+      var kept, removed: seq[string]
+      proc store(scope: seq[string], manifest: bool): string =
+        let id =
+          if manifest:
+            computeContentId(repo, commitState("HEAD"), caManifestV1Sha256, scope)
+          else:
+            computeContentId(repo, commitState("HEAD"), scope)
+        require id.outcome == coComputed
+        let stored = putCertificate(dir / "store", certificateText(id.id))
+        require stored.ok
+        ageTree(stored.path.parentDir, 1000)
+        stored.path
+
+      for manifest in [false, true]:
+        kept.add store(@[], manifest)
+        kept.add store(@["src", "lib"], manifest)
+        removed.add store(@["src"], manifest)
+        removed.add store(@["docs"], manifest)
+
+      # Invalid: a misspelt key beside the valid one. Nothing goes, not
+      # even an interrupted prune's leftover.
+      discard gitIn(repo, ["config", "testCertificatesScope.code.paths", "docs"])
+      let leftover = dir / "store" / "v1" / ("git-tree-" & format) / ".leftover"
+      createDir(leftover)
+      let refused =
+        runCliProcess(["prune", "--keep", "0"], storeEnv(dir / "store"), cwd = repo)
+      checkpoint refused.errors
+      check refused.exitCode == 1
+      check "invalid scope declaration" in refused.errors
+      check "testcertificatesscope.code.paths" in refused.errors
+      for path in kept & removed:
+        check fileExists(path)
+      check dirExists(leftover)
+
+      discard gitIn(repo, ["config", "--unset", "testCertificatesScope.code.paths"])
+      let run =
+        runCliProcess(["prune", "--keep", "0"], storeEnv(dir / "store"), cwd = repo)
+      checkpoint run.errors
+      check run.exitCode == 0
+      for path in kept:
+        check fileExists(path)
+      for path in removed:
+        check not fileExists(path)
+      check not dirExists(leftover)
+
+      # The library call agrees, and a scope given both ways counts once.
+      let both = pruneProtection(repo, @[@["lib", "src"]])
+      check both.ok
+      check both.ids.len == 4
+      check both.ids == pruneProtection(repo).ids
 
   test "bare repositories protect HEAD, and failed protection never prunes":
     let dir = scratchDir()

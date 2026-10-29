@@ -59,7 +59,8 @@ Commands:
               2 uncomputable id, 3 incomplete empty search, 64 usage error.
   prune       Remove content directories beyond the newest n (default 20),
               protecting HEAD in native git-tree and manifest algorithms,
-              unscoped and in each scope declared by a --paths group.
+              unscoped, in each scope declared by a --paths group and in
+              each scope the repository declares.
   notes       Carry certificates in git notes on each commit's tree, and on
               its scoped tree in every scope the repository declares
               (git config testCertificatesScope.<name>.path, one path per
@@ -379,7 +380,7 @@ proc pruneCommand(io: CliIo, args: seq[string]): int =
       return 1
     root = r.user
   # Resolve every protection before pruneRoot can rename or delete anything.
-  let protection = headContentIds(getCurrentDir(), scopes)
+  let protection = pruneProtection(getCurrentDir(), scopes)
   if not protection.ok:
     io.errors.say "test-certificates: " & protection.problem
     return 1
