@@ -16,10 +16,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Coverage: the three Nix legs (Linux x64, Linux arm64, macOS arm64). Windows
-# is a documented exception for now: the dev environment is the Nix flake, and
-# `put --system` is deliberately unsupported on Windows (see
-# docs/users/README.md); a Windows leg arrives with the release packaging.
+# Coverage: the three Nix legs (Linux x64, Linux arm64, macOS arm64) and a
+# Windows x64 leg without Nix (scripts/windows/test.ps1). `put --system` is
+# deliberately unsupported on Windows (see docs/users/README.md); its tests
+# are POSIX-only, each marked in its file.
 
 jobs:
   choose-linux:
@@ -135,6 +135,58 @@ jobs:
           region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
           access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
           secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
+
+  test-windows:
+    name: Test (windows-x64)
+    # The persistent Windows runners (the ephemeral Windows pool is disabled):
+    # `dev-env-ready` because the job uses the shared DIY toolchain those
+    # runners carry (nim, WinLibs gcc, Git for Windows). There is no Nix on
+    # Windows, so the suite runs through scripts/windows/test.ps1, the
+    # equivalent of `just test`.
+    runs-on: [self-hosted, windows, x64, dev-env-ready]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout the specification (for its conformance vectors)
+        uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/test-certificates-spec
+          path: .ci/test-certificates-spec
+          fetch-depth: 0
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          # The PATH `gcc` on these runners is not the provisioned toolchain;
+          # the profile installs WinLibs GCC per service account. Put it first.
+          $gccRoots = @(
+            "$env:LOCALAPPDATA\repo-workspaces\toolchains\gcc",
+            'C:\Windows\ServiceProfiles\NetworkService\AppData\Local\repo-workspaces\toolchains\gcc',
+            'C:\Windows\System32\config\systemprofile\AppData\Local\repo-workspaces\toolchains\gcc'
+          )
+          $gccBin = $null
+          foreach ($r in $gccRoots) {
+            if (Test-Path $r) {
+              $cand = Get-ChildItem $r -Directory | Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName 'bin' } |
+                Where-Object { Test-Path (Join-Path $_ 'gcc.exe') } | Select-Object -First 1
+              if ($cand) { $gccBin = $cand; break }
+            }
+          }
+          if (-not $gccBin) { throw "no provisioned WinLibs gcc found under: $($gccRoots -join ', ')" }
+          $env:PATH = "$gccBin;$env:PATH"
+          ./scripts/windows/test.ps1 -SpecDir .ci/test-certificates-spec 2>&1 | Tee-Object test.log
+          if (-not $?) { throw "the Windows test suite failed" }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-windows-x64
+          path: test.log
+          retention-days: 7
 
   nix-build:
     needs: [choose-linux, choose-macos]

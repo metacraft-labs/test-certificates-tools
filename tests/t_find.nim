@@ -149,7 +149,7 @@ suite "find":
       ("a.txt", "a\n"),
       ("src/b.txt", "b\n"),
       ("d.txt", "d\n"),
-      ("lit*/x", "star\n"),
+      ("lit[A]/x", "star\n"),
       ("litA/x", "plain\n"),
       ("other/y", "y\n"),
     ]:
@@ -215,11 +215,12 @@ suite "find":
     check run.exitCode == 0
     check run.output == headCert & "\n"
 
-    # Literal pathspecs: `lit*` names that directory, not a pattern matching
-    # `litA` too; and the scoped id keeps full paths.
-    let literal = computeContentId(repo, worktreeState(), caGitTreeSha1, ["lit*"])
+    # Literal pathspecs: `lit[A]` names that directory, not a pattern matching
+    # `litA` too (a glob character Windows also allows in a name); and the
+    # scoped id keeps full paths.
+    let literal = computeContentId(repo, worktreeState(), caGitTreeSha1, ["lit[A]"])
     check literal.outcome == coComputed
-    check literal.id == "git-tree-sha1:" & treeOfFreshRepo([("lit*/x", "star\n")])
+    check literal.id == "git-tree-sha1:" & treeOfFreshRepo([("lit[A]/x", "star\n")])
     check literal.id != "git-tree-sha1:" & treeOfFreshRepo([("x", "star\n")])
 
     # The user's index was neither modified nor rewritten.
@@ -232,6 +233,8 @@ suite "find":
 
   test "the working-tree id reads content, not stat data (racy git)":
     when defined(windows):
+      # POSIX only: it relies on an unchanged inode and on git's minimal
+      # stat check, which Git for Windows does not keep in the same form.
       skip()
     else:
       let repo = newRepo()

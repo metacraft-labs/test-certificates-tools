@@ -163,6 +163,13 @@ proc relativeOf*(text: string): string =
   doAssert name.ok, name.problem
   name.relativePath
 
+proc relativeDirOf*(text: string): string =
+  ## The content directory of ``relativeOf(text)``, ``/``-separated as the
+  ## library reports it on every platform (``parentDir`` would use ``\``
+  ## on Windows).
+  let relative = relativeOf(text)
+  relative[0 ..< relative.rfind('/')]
+
 # ---------------------------------------------------------------------------
 # The specification's vectors, at a pinned commit
 # ---------------------------------------------------------------------------

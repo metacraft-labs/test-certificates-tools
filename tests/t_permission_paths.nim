@@ -1,8 +1,12 @@
 ## Real filesystem permission and FIFO fixtures; no mocks.
 import std/unittest
-import ./helpers
-import test_certificates
-when not defined(windows):
+when defined(windows):
+  # POSIX-only: every case here is a system-store write or prune, which is
+  # unsupported on Windows (docs/users/README.md), or a POSIX file type.
+  echo "t_permission_paths: POSIX-only (system-store writes and pruning are unsupported on Windows); no case applies"
+else:
+  import ./helpers
+  import test_certificates
   import std/posix except Time
 const Content = "git-tree-sha1:1111111111111111111111111111111111111111"
 suite "system store path permissions":

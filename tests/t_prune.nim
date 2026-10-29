@@ -150,7 +150,7 @@ suite "prune":
           let stored = putCertificate(dir / "store", certificateText(id.id))
           require stored.ok
           paths.add stored.path
-          expected.add relativeOf(certificateText(id.id)).parentDir
+          expected.add relativeDirOf(certificateText(id.id))
       # Undeclared subsets do not become scopes, and modified state does not
       # substitute for the content actually committed at HEAD.
       var removed: seq[string]
@@ -394,6 +394,8 @@ suite "prune":
 
   test "prune --system prunes a partition its owner holds, and refuses a link":
     when defined(windows):
+      # POSIX only: `prune --system` is unsupported on Windows
+      # (docs/users/README.md).
       skip()
     else:
       let dir = scratchDir()
@@ -479,7 +481,7 @@ suite "prune":
             )
         ,
       )
-      check pruned.removed == @[relativeOf(first).parentDir]
+      check pruned.removed == @[relativeDirOf(first)]
       check pruned.errors.len == 0
 
     let r = putCertificate(store, first, beforeRename = hook)

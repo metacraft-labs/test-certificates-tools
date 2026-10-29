@@ -15,7 +15,9 @@
 ##
 ## No mocks.
 
-import std/[osproc, sequtils, sets, streams, strtabs, tables, unittest]
+import std/[osproc, sequtils, sets, strtabs, tables, unittest]
+when not defined(windows):
+  import std/streams # The publishers' stderr is read on POSIX only.
 import ./helpers
 import test_certificates
 
@@ -32,7 +34,15 @@ proc spawnPut(files: seq[string], env: seq[(string, string)]): Process =
     e[k] = v
   for (k, v) in env:
     e[k] = v
-  startProcess(cliBinary(), args = @["put"] & files, env = e, options = {})
+  # On Windows an anonymous pipe holds 4 KiB, which the publishers' output
+  # outgrows while this test polls them without reading it: they would block
+  # on a full pipe forever. There they write to this test's own streams.
+  let options: set[ProcessOption] =
+    when defined(windows):
+      {poParentStreams}
+    else:
+      {}
+  startProcess(cliBinary(), args = @["put"] & files, env = e, options = options)
 
 proc modeOf(path: string): int =
   when defined(windows):
@@ -103,8 +113,9 @@ suite "put":
             foreign.add name & " (" & $bytes.len & " bytes)"
     for p in processes:
       let code = p.waitForExit()
-      if code != 0:
-        checkpoint p.errorStream.readAll()
+      when not defined(windows):
+        if code != 0:
+          checkpoint p.errorStream.readAll()
       check code == 0
       p.close()
     check foreign.len == 0
@@ -191,6 +202,7 @@ suite "put":
     # rewrites in place (what `cat > final` does) must be caught by the same
     # read-and-compare loop.
     when defined(windows):
+      # POSIX only: the non-atomic writer is `/bin/sh` running `cat > target`.
       skip()
     else:
       let dir = scratchDir()

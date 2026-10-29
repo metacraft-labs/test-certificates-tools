@@ -284,7 +284,10 @@ other records are still imported. Standard output lists the stored paths.
 
 **`notes push`** pushes the local ref without force. When the remote ref has
 moved, it fetches it, merges the **union** of both sides' records into the
-local ref, and tries again — five attempts in all, with backoff. **`notes
+local ref, and tries again — five attempts in all, with backoff. A lost race
+is told by reading the remote ref again, never from the server's wording; a
+refusal while the remote ref has not moved (a server hook, a permission) is
+tried once more and then reported. **`notes
 fetch`** fetches the remote ref and merges it into the local one the same
 way. The merge never lets one side win: for every annotated tree, the result
 keeps the remote pieces in their order, then appends missing local records and
@@ -310,6 +313,14 @@ with git's configured identity. Where git has none — a CI container, say —
 they are made as `test-certificates <test-certificates@localhost>` and a
 `note:` line on standard error says so. A notes commit's author carries no
 weight: what a certificate is worth is its signature (Transport §3).
+
+While they run they keep private refs under
+`refs/notes/test-certificates-work/` and `refs/test-certificates/fetch/`, and
+delete them when done. A run that is killed cannot; the next `publish`,
+`push` or `fetch` in the repository deletes what such a run left behind: a
+ref older than an hour, or one made on this host by a process that no longer
+exists (and older than a minute). Each name records the host, process and
+time that made it.
 
 Exit 0 on success, 1 when an operation failed (reported), 2 on a usage
 error. A note piece that is reported and skipped is not a failure.
@@ -377,9 +388,13 @@ push`, or `git push origin refs/notes/…`, runs the hook without it pushing
   There is no unlimited setting
   ([Tooling §4.3](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Tooling.md#43-publishing-pushing-and-the-time-budget)):
   any other value is reported and the default used. A `git` still running
-  when the budget is spent is stopped (SIGTERM, then SIGKILL), reported, and
-  the push goes on. **Not yet on Windows**, where the budget is checked only
-  between operations, so one `git` that never returns still holds the push.
+  when the budget is spent is stopped together with everything it started
+  (`ssh`, a credential helper), reported, and the push goes on: on Linux and
+  macOS its process group gets SIGTERM, then SIGKILL; on Windows its job
+  object is terminated. On Linux and macOS, `git` and its helpers run without
+  a controlling terminal there, so an `ssh` that would ask for a passphrase on the
+  terminal fails at once (use an agent) instead of waiting unseen for the
+  budget to run out. Interrupting the push (Ctrl-C) stops them as well.
 - **Opting out of one push:** `TEST_CERTIFICATES_HOOK=off git push …` (also
   `0`, `false`, `no`). The hook says it skipped propagation. `git push
 --no-verify` skips every `pre-push` hook, this one included.
@@ -389,7 +404,7 @@ What it prints, on standard error, prefixed `test-certificates:`:
 ```
 test-certificates: 2 certified tree(s) among 3 pushed commit(s): 3 certificate(s) added to refs/notes/test-certificates/certificates; pushed to origin
 test-certificates: no stored certificates for the 1 commit(s) this push introduces; nothing to propagate
-test-certificates: warning: pushing refs/notes/test-certificates/certificates to origin failed: [remote rejected] (hook declined)
+test-certificates: warning: pushing refs/notes/test-certificates/certificates to origin was refused: [remote rejected] (hook declined)
 test-certificates: warning: certificates were NOT fully propagated; the push continues. Retry with `test-certificates notes push origin`.
 ```
 
@@ -419,7 +434,8 @@ It finds the tool on `PATH` when the push runs, rather than naming the binary
 that installed it, which may have been a Nix store path collected since.
 
 Library: `prePushHook(dir, remoteName, remoteUrl, input, roots, options):
-HookReport`, `parsePrePushInput(text)`, `installPrePushHook(dir)`,
+HookReport` (`introducedCount` is how many commits the push introduces;
+`certified` lists those whose certificates were carried), `parsePrePushInput(text)`, `installPrePushHook(dir)`,
 `PrePushHookScript`.
 
 ## Carrying certificates with every push

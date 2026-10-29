@@ -46,13 +46,15 @@ test-one name: build
 lint: lint-nim lint-nix
 
 # Formatting is nph's, and every module type-checks with no warnings. The
-# Windows code paths are type-checked by a cross `nim check`.
+# Windows code paths, the tests included, are type-checked by a cross `nim check`.
 lint-nim:
     nph --check src tests
-    for f in src/test_certificates.nim src/test_certificates_cli.nim tests/t_*.nim; do \
+    for f in src/test_certificates.nim src/test_certificates_cli.nim tests/t_*.nim tests/process_helper.nim; do \
       nim check --hints:off --warningAsError:UnusedImport:on "$f"; \
     done
-    nim check --hints:off --os:windows src/test_certificates_cli.nim
+    for f in src/test_certificates.nim src/test_certificates_cli.nim tests/t_*.nim tests/process_helper.nim; do \
+      nim check --hints:off --os:windows "$f"; \
+    done
 
 lint-nix:
     nixfmt --check flake.nix

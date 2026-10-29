@@ -175,34 +175,55 @@ suite "declared scopes":
     let repo = scratch / "r"
     createDir(repo)
     discard gitIn(repo, ["init", "-q"])
-    write(repo, "a b/c d", "spaces\n")
-    write(repo, "new\nline", "newline\n")
-    write(repo, "ünï/cödé", "unicode\n")
-    write(repo, "a\", \"b", "X\n")
-    write(repo, "c", "Y\n")
-    write(repo, "a", "X\n")
-    write(repo, "b\", \"c", "Y\n")
-    createSymlink("a b", repo / "link")
-    commitAll(repo, "one")
-    let tree = treeOf(repo, "HEAD")
-    let scopes = @[
+    # The commit is made by `git fast-import`, not from a working tree: a
+    # name holding a newline or `"` cannot exist on Windows, nor can a
+    # symbolic link without privilege, and the scoped trees are computed
+    # from trees alone. Paths are C-style quoted where they need it.
+    var stream =
+      "commit refs/heads/main\ncommitter T <t@example.invalid> 0 +0000\ndata 3\none\n"
+    var entries = @[
+      ("100644", "\"a b/c d\"", "spaces\n"),
+      ("100644", "ünï/cödé", "unicode\n"),
+      ("100644", "c", "Y\n"),
+      ("100644", "a", "X\n"),
+      ("120000", "link", "a b"),
+    ]
+    var scopes = @[
       DeclaredScope(names: @["s"], paths: @["a b"]),
-      DeclaredScope(names: @["n"], paths: @["new\nline"]),
       DeclaredScope(names: @["u"], paths: @["ünï"]),
       DeclaredScope(names: @["l"], paths: @["link"]),
       DeclaredScope(names: @["through"], paths: @["link/c d"]),
-      DeclaredScope(names: @["x"], paths: @["a\", \"b", "c"]),
-      DeclaredScope(names: @["y"], paths: @["a", "b\", \"c"]),
     ]
-    check scopeLabel(scopes[5].paths) == scopeLabel(scopes[6].paths)
+    # POSIX only: Git for Windows refuses a path holding a newline or `"`
+    # (core.protectNTFS) in a tree it builds and in an index alike, so such a
+    # repository cannot be worked with there at all.
+    when not defined(windows):
+      entries.add @[
+        ("100644", "\"new\\nline\"", "newline\n"),
+        ("100644", "\"a\\\", \\\"b\"", "X\n"),
+        ("100644", "\"b\\\", \\\"c\"", "Y\n"),
+      ]
+      scopes.add @[
+        DeclaredScope(names: @["n"], paths: @["new\nline"]),
+        DeclaredScope(names: @["x"], paths: @["a\", \"b", "c"]),
+        DeclaredScope(names: @["y"], paths: @["a", "b\", \"c"]),
+      ]
+    for (mode, path, content) in entries:
+      stream.add "M " & mode & " inline " & path & "\ndata " & $content.len & "\n" &
+        content & "\n"
+    discard gitIn(repo, ["fast-import", "--quiet"], input = stream)
+    let tree = treeOf(repo, "refs/heads/main")
+    when not defined(windows):
+      check scopeLabel(scopes[5].paths) == scopeLabel(scopes[6].paths)
     let computed = scopedTrees(repo, 40, [tree], scopes)
     checkpoint computed.problem
     require computed.ok
     for i, s in scopes:
       checkpoint scopeLabel(s.paths)
       check computed.trees[tree][i] == recipeTree(repo, tree, s.paths, scratch)
-    check computed.trees[tree][4] == EmptyTreeSha1 # Not followed.
-    check computed.trees[tree][5] != computed.trees[tree][6]
+    check computed.trees[tree][3] == EmptyTreeSha1 # Not followed.
+    when not defined(windows):
+      check computed.trees[tree][5] != computed.trees[tree][6]
 
 suite "scoped notes":
   test "scoped_certificates_are_published_and_imported_on_their_scoped_trees":
