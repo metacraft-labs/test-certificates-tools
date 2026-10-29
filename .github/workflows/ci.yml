@@ -48,6 +48,9 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
         with:
           env-flavor: nix
+          # The nix flavor refuses an empty token. Every flake input of this
+          # public repository is public, so the job's own token suffices.
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run lint
         # `shell: bash` selects `-eo pipefail`, without which `| tee` would
@@ -108,6 +111,9 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
         with:
           env-flavor: nix
+          # The nix flavor refuses an empty token. Every flake input of this
+          # public repository is public, so the job's own token suffices.
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run tests
         shell: bash
@@ -204,6 +210,9 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
         with:
           env-flavor: nix
+          # The nix flavor refuses an empty token. Every flake input of this
+          # public repository is public, so the job's own token suffices.
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: nix build
         shell: bash
