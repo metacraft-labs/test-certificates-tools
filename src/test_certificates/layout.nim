@@ -13,6 +13,9 @@
 
 import std/[os, strutils, times, atomics]
 
+when defined(windows):
+  import std/widestrs
+
 const
   LayoutVersion* = "v1"
   RecordSuffix* = ".toml"
@@ -98,3 +101,64 @@ proc extendedPath*(path: string): string =
     if path.len < LongPathThreshold:
       return path
   extendedTreePath(path)
+
+when defined(windows):
+  proc createDirectoryW(
+    path: WideCString, security: pointer
+  ): int32 {.stdcall, dynlib: "kernel32", importc: "CreateDirectoryW".}
+
+  const ErrorAlreadyExists = OSErrorCode(183)
+
+  proc volumeEnd(extended: string): int =
+    ## The index just past the volume part of an extended-length path:
+    ## ``\\?\C:\`` or ``\\?\UNC\server\share\``. Nothing at or above it is a
+    ## directory this tool creates. -1 if ``extended`` has neither form.
+    if extended.startsWith(r"\\?\UNC\"):
+      # Skip the server and share names, the first two components.
+      var seps = 0
+      for i in len(r"\\?\UNC\") ..< extended.len:
+        if extended[i] == '\\':
+          inc seps
+          if seps == 2:
+            return i + 1
+      return extended.len # the share itself: nothing below it to create
+    let drive = len(r"\\?\C:\")
+    if extended.len >= drive and extended[5] == ':' and extended[6] == '\\':
+      return drive
+    -1
+
+proc createDirTree*(dir: string) =
+  ## Create ``dir`` and its missing ancestors, at any length. On Windows a
+  ## content directory is ``<root>\v1\<algorithm>\<digest>``, 84 characters
+  ## below the root for SHA-256, and ``CreateDirectoryW`` refuses a plain path
+  ## past 248 characters (MAX_PATH less room for an 8.3 name), so a deep user
+  ## root could hold no record even though the record paths themselves are
+  ## written in the extended-length form. ``std/os.createDir`` walks a path's
+  ## components and does not understand the ``\\?\`` prefix, so this walks
+  ## them itself, creating each missing one in that form. A path that has no
+  ## extended form (a relative one), and every path on POSIX, goes to
+  ## ``createDir``. Raises ``OSError`` naming the component that could not be
+  ## created; one created concurrently by another writer is not an error.
+  ## https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectoryw
+  when defined(windows):
+    var target = extendedTreePath(dir)
+    let floor = volumeEnd(target)
+    if floor < 0:
+      createDir(dir)
+      return
+    while target.len > floor and target[^1] == '\\':
+      target.setLen(target.len - 1)
+    var i = floor
+    while i < target.len:
+      var stop = target.find('\\', i)
+      if stop < 0:
+        stop = target.len
+      let component = target[0 ..< stop]
+      if not dirExists(component):
+        if createDirectoryW(newWideCString(component), nil) == 0:
+          let code = osLastError()
+          if code != ErrorAlreadyExists or not dirExists(component):
+            raiseOSError(code, component)
+      i = stop + 1
+  else:
+    createDir(dir)

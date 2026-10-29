@@ -423,7 +423,7 @@ else:
     result.signed = signed
     let dir = result.path.parentDir
     try:
-      createDir(root)
+      createDirTree(root)
     except OSError as err:
       result.problem = "could not create the store root: " & err.msg
       return
@@ -434,7 +434,13 @@ else:
     var lockHandle: int
     while true:
       lockHandle = createFileW(
-        newWideCString(root / ".write-lock"), 0xC0000000'u32, 0, nil, 4, 0x80, 0
+        newWideCString(extendedPath(root / ".write-lock")),
+        0xC0000000'u32,
+        0,
+        nil,
+        4,
+        0x80,
+        0,
       )
       if lockHandle != -1:
         break
@@ -448,7 +454,7 @@ else:
     for attempt in 0 .. 1:
       result.retried = attempt > 0
       try:
-        createDir(dir)
+        createDirTree(dir)
       except OSError as err:
         result.problem = "could not create '" & dir & "': " & err.msg
         return
@@ -469,7 +475,7 @@ else:
           return
       if keep:
         try:
-          setLastModificationTime(dir, getTime())
+          setLastModificationTime(extendedPath(dir), getTime())
         except OSError:
           discard
         result.ok = true
