@@ -329,6 +329,39 @@ suite "put":
       check modeOf(root / "v1") == 0o700
       check modeOf(run.output.strip()) == 0o600
 
+  test "a content directory past 248 characters is created under a deep root":
+    # Windows: CreateDirectoryW refuses a plain path past 248 characters
+    # (MAX_PATH less room for an 8.3 name). A SHA-256 content directory is
+    # the root plus 84 characters, so under a root of about 165 characters or
+    # more `put` could not create it, although the record inside it is
+    # written in the extended-length form. The root is sized so the content
+    # directory lands well past that limit while the root itself (and its
+    # missing parent) stays under it; on POSIX the same layout must simply
+    # work. The second put keeps the stored copy and touches its directory,
+    # which must not fail at that length either.
+    let dir = scratchDir()
+    defer:
+      cleanup(dir)
+    let digest = repeat('5', 64)
+    let id = "git-tree-sha256:" & digest
+    const rootTarget = 200 # its content directory is 284 characters
+    let padLen = rootTarget - dir.len - len("/nest/")
+    require padLen >= 1 # the scratch directory leaves room for the layout
+    let root = dir / "nest" / repeat('q', padLen)
+    let text = certificateText(id)
+    let run = runCliProcess(["put", "-"], storeEnv(root), input = text)
+    checkpoint run.errors
+    check run.exitCode == 0
+    let stored = run.output.strip()
+    check stored == root / toNative(relativeOf(text))
+    let contentDir = stored.parentDir
+    checkpoint "content directory: " & $contentDir.len & " characters"
+    require contentDir.len > 248
+    check readFile(extendedPath(stored)) == text
+    let again = putCertificate(root, text)
+    checkpoint again.problem
+    check again.ok and again.kept
+
   test "records that cannot be named are refused, and nothing is written":
     let dir = scratchDir()
     defer:
