@@ -322,6 +322,7 @@ suite "prune":
       var systemPaths: seq[string]
       for id in [native.id, manifest.id]:
         let stored = putCertificate(partition, certificateText(id), system = true)
+        checkpoint stored.problem
         require stored.ok
         systemPaths.add stored.path
         ageTree(stored.path.parentDir, 1000)

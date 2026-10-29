@@ -411,6 +411,7 @@ suite "put":
           storeEnv(dir / "user", dir / "system"),
           input = text,
         )
+        checkpoint run.errors
         check run.exitCode == 0
         check run.output.strip() == partition / relative
         check modeOf(partition / "v1") == 0o755

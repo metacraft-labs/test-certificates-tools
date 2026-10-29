@@ -61,6 +61,7 @@ suite "system store path permissions":
         createDir(root)
         require chmod(root.cstring, Mode(0o755)) == 0
         let put = putCertificate(root, certificateText(Content), system = true)
+        checkpoint put.problem
         require put.ok
         var content = put.path.parentDir
         if leftover:
@@ -84,6 +85,7 @@ suite "system store path permissions":
       createDir(root)
       require chmod(root.cstring, Mode(0o755)) == 0
       let put = putCertificate(root, certificateText(Content), system = true)
+      checkpoint put.problem
       require put.ok
       let content = put.path.parentDir
       ageTree(content, 1000)
@@ -116,6 +118,7 @@ suite "system store path permissions":
       createDir(root)
       require chmod(root.cstring, Mode(0o755)) == 0
       let put = putCertificate(root, certificateText(Content), system = true)
+      checkpoint put.problem
       require put.ok
       ageTree(put.path.parentDir, 1000)
       let outside = dir / "outside"
