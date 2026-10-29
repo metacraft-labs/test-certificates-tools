@@ -12,14 +12,14 @@
 ## (``just build``), ``git`` on ``PATH``, and a checkout of the specification
 ## repository that contains the pinned commit.
 
-import std/[os, strutils, tempfiles, times]
+import std/[os, sets, strutils, tempfiles, times]
 import test_certificates
 import test_certificates/git
 
 when not defined(windows):
   import std/posix except Time
 
-export os, strutils, times, git
+export os, sets, strutils, times, git
 
 let repoRoot* = currentSourcePath().parentDir.parentDir
 
@@ -247,3 +247,70 @@ proc recipientAccount*(): string =
     if entry == nil or entry.pw_uid == geteuid():
       fatal "system-store tests require a distinct nobody account"
     $entry.pw_uid
+
+# ---------------------------------------------------------------------------
+# Clones of a bare remote, each with its own store and git configuration
+# ---------------------------------------------------------------------------
+
+type Clone* = object
+  ## A clone of a bare remote with a store and a git configuration of its own.
+  dir*: string ## Working tree.
+  store*: string ## Its user root.
+  env*: seq[(string, string)]
+
+proc isolatedEnv*(scratch, store: string): seq[(string, string)] =
+  let config = scratch / "isolated-gitconfig"
+  if not fileExists(config):
+    writeFile(config, "[user]\n\tuseConfigOnly = true\n")
+  result = storeEnv(store, scratch / "system")
+  result.add ("GIT_CONFIG_GLOBAL", config)
+  result.add ("GIT_CONFIG_NOSYSTEM", "1")
+  result.add ("EMAIL", "") # git takes an address from it before guessing.
+
+proc tc*(
+    c: Clone, args: openArray[string], extra: openArray[(string, string)] = []
+): CliRun =
+  runCliProcess(args, c.env & @extra, cwd = c.dir)
+
+proc newBareRemote*(scratch: string, objectFormat = "sha1"): string =
+  result = scratch / "remote.git"
+  createDir(result)
+  discard gitIn(result, ["init", "-q", "--bare", "--object-format=" & objectFormat])
+
+proc newClone*(scratch, remote, name: string): Clone =
+  result.dir = scratch / name
+  result.store = scratch / (name & "-store")
+  discard gitIn(scratch, ["clone", "-q", remote, result.dir])
+  result.env = isolatedEnv(scratch, result.store)
+
+proc treeOf*(repo, rev: string): string =
+  gitIn(repo, ["rev-parse", rev & "^{tree}"]).strip()
+
+proc noteBlob*(repo, annotated: string, notesRef = DefaultNotesRef): string =
+  ## The note's exact bytes, or "" when there is none.
+  let listed = git(repo, ["notes", "--ref", notesRef, "list", annotated])
+  if not listed.ok:
+    return ""
+  gitIn(repo, ["cat-file", "blob", listed.stdout.strip()])
+
+proc noteKeys*(repo: string, notesRef = DefaultNotesRef): HashSet[string] =
+  let listed = git(repo, ["notes", "--ref", notesRef, "list"])
+  if listed.ok:
+    for line in listed.stdout.splitLines():
+      let f = line.splitWhitespace()
+      if f.len == 2:
+        result.incl f[1]
+
+proc putIn*(c: Clone, text: string) =
+  let r = putCertificate(c.store, text)
+  doAssert r.ok, r.problem
+
+proc gitWith*(
+    dir: string, args: openArray[string], env: openArray[(string, string)], input = ""
+): GitRun =
+  ## Run git in ``dir`` with ``env`` added and answer what it did, failing
+  ## only when git could not be run at all.
+  let run = runProcess("git", args, dir, env, input)
+  if not run.started:
+    fatal "git is not runnable: " & run.failure
+  run

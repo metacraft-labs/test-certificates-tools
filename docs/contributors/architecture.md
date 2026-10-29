@@ -25,6 +25,7 @@ them by section.
 | `prune`         | Rename-aside pruning (Transport §2.5).                                                                                                                         |
 | `note_framing`  | The note blob of Transport §3.1: split on delimiter lines, render byte for byte, the writer rule (`addRecord`), the union of two blobs (`mergeNotes`). No git. |
 | `notes`         | The notes carrier (Transport §3, Tooling §3): `publish`, `import`, `push`, `fetch`, the notes ref and its configuration, the union merge of two notes commits. |
+| `hook`          | The `pre-push` hook body (Tooling §4): git's hook input, the commits a push introduces, publish and push with hooks off and a time budget; `hook install`.     |
 | `cli`           | The command line as a library procedure (`runCli`); `src/test_certificates_cli.nim` is the three-line executable.                                              |
 
 Every operation returns a result object carrying its error; nothing raises to
@@ -162,6 +163,54 @@ permission) is reported at once. The push runs with `LC_ALL=C` because the
 reason after `[remote rejected]` is read; the `--porcelain` flag column
 alone does not tell a lost race from a refusal.
 
+## The pre-push hook
+
+**What a push introduces** is computed per pushed ref as `<remote>..<local>`
+when the clone has the remote's object, and otherwise as what the remote's
+remote-tracking refs do not reach; the other refs' remote objects in the same
+push are excluded too, since they are on the remote. One `git rev-list
+--format=%T` lists the commits with their trees, and only trees with a content
+directory in either root are published: listing `v1/<algorithm>/` once is
+cheaper than a `find` per commit, and keeps a push to a URL (whole history
+considered) cheap. Nothing is pushed when nothing was certified, so a push
+with no certificates makes no network operation.
+
+**Refs under `refs/notes/` are ignored.** A user's `notes push` runs the
+`pre-push` hook; without this the hook would publish nothing (no certificate
+names a notes tree) and then push the notes ref itself, racing the push that
+started it.
+
+**Never failing** is enforced at the command line: `hook pre-push` answers 0
+on every path, including a usage error and an unexpected exception or
+defect, and reads its standard input to the end first so git never sees a
+broken pipe. The hook `hook install` writes does not `exec` the tool: it
+ignores the tool's status and drains what is left of the input, so even a
+crash that no handler sees (a signal) lets the push go on.
+
+**The time budget.** `PushOptions.timeoutMs` bounds everything `pushNotes`
+does over the network; `git.runProcess(timeoutMs)` stops a git that outlives
+it (SIGTERM, SIGKILL a second later) and does not wait for its pipes to
+close, because a remote helper it started (`ssh`, or `sleep` behind the
+tests' `ext::` remote) can hold them open after git is gone. A process that
+had already exited when the time ran out keeps its own answer. Windows drains
+its pipes blocking, so the budget is checked only between operations there.
+
+**Starting processes.** On POSIX, `git.runProcess` starts its child itself
+(`fork` and `execve`) rather than through Nim's `osproc.startProcess`. That
+one creates its pipes without close-on-exec and `dup2`s them onto 0–2
+without closing the originals, so every child holds a second copy of each
+pipe end above 2 and passes it to everything it starts. A process that
+detaches and redirects its standard streams — an `ssh` control master, a
+`credential-cache` daemon, the `sleep` behind the tests' `ext::` remote —
+then still holds the caller's pipes, and a caller that reads them to the end
+(the hook capturing `git push`, or a dispatcher capturing the hook) waits for
+it to exit. Here every pipe end is close-on-exec and only the copies on 0–2
+reach the child; `tests/t_process.nim` lists the child's descriptors and
+times a run that leaves a detached grandchild behind. `posix_spawn` is not
+used because starting the child in another directory needs
+`posix_spawn_file_actions_addchdir_np`, which the glibc 2.28 the release
+binaries are linked against lacks. Windows still uses `startProcess`.
+
 ## Tests
 
 `just test` builds the executable and runs every `tests/t_*.nim`. Tests use
@@ -193,6 +242,12 @@ the same checkers to report it.
 The notes tests (`t_notes.nim`) run real clones against a real bare remote in
 a scratch directory, with an empty global git configuration, and race
 several `notes push` processes against one another.
+
+The hook tests (`t_hook.nim`) drive real `git push` commands with a hook
+that counts its runs and then execs the built binary, so recursion is
+observed, not inferred. Remote failures are real: a bare remote whose
+`update` hook refuses `refs/notes/*`, a path that is not a repository, and
+git's `ext::` transport running `sleep` for a remote that never answers.
 
 A missing prerequisite (the binary, git, the specification checkout or the
 pinned commit) fails the suite; nothing is skipped silently. The only skips

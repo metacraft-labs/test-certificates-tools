@@ -19,9 +19,12 @@
 ## * every other command, `notes` included: 0 success, 1 an operation
 ##   failed, 2 usage error. A note piece that is reported and skipped (Transport
 ##   §3.1) is not a failure.
+## * ``hook pre-push``: always 0, whatever happened (Tooling §4: it never
+##   fails the push it is attached to); what could not be propagated is
+##   reported on standard error.
 
 import std/[os, sequtils, strutils]
-import ./[roots, put, find, prune, content_state, notes]
+import ./[roots, put, find, prune, content_state, notes, hook]
 
 const
   Version* = block:
@@ -42,6 +45,8 @@ Usage:
   test-certificates notes publish <commit>|<range>...
   test-certificates notes import [<commit>|<range>...]
   test-certificates notes (push|fetch) <remote>
+  test-certificates hook pre-push <remote-name> <remote-url>
+  test-certificates hook install [--print]
   test-certificates --help | --version
 
 Commands:
@@ -64,6 +69,13 @@ Commands:
                 push     push the notes ref; on a race, fetch, merge the
                          union of both sides and retry
                 fetch    fetch the remote notes ref and merge the union
+  hook        pre-push: a complete pre-push hook body (git passes the
+              arguments and standard input); publishes and pushes notes for
+              the commits the push introduces and ALWAYS exits 0.
+              TEST_CERTIFICATES_HOOK=off skips it; TEST_CERTIFICATES_HOOK_TIMEOUT
+              (seconds, default 60, 0 for none) bounds its network time.
+              install: write it as this repository's pre-push hook, unless
+              one exists; --print shows the hook instead.
 """
 
 type CliIo* = object
@@ -474,6 +486,123 @@ proc notesCommand(io: CliIo, args: seq[string]): int =
     usageError(io, "unknown notes subcommand " & args[0])
 
 # ---------------------------------------------------------------------------
+# hook
+# ---------------------------------------------------------------------------
+
+const
+  HookSwitchVariable* = "TEST_CERTIFICATES_HOOK"
+    ## ``off`` (or ``0``, ``false``, ``no``) turns ``hook pre-push`` into a
+    ## no-op that says so.
+  HookTimeoutVariable* = "TEST_CERTIFICATES_HOOK_TIMEOUT"
+    ## Seconds the hook's network operations may take in all; 0 for no limit.
+  DefaultHookTimeoutSeconds* = 60
+
+proc hookSay(io: CliIo, line: string) =
+  io.errors.say "test-certificates: " & line
+
+proc prePushCommand(io: CliIo, args: seq[string]): int =
+  ## Tooling §4. Every path answers 0: the hook never fails the push. Its
+  ## standard input is always read to the end, so git never sees a broken
+  ## pipe from a hook that stopped listening.
+  result = 0
+  var input = ""
+  try:
+    input = io.input.readAll()
+  except IOError as err:
+    hookSay io, "warning: could not read the pushed refs: " & err.msg
+  let switch = getEnv(HookSwitchVariable).strip().toLowerAscii()
+  if switch in ["off", "0", "false", "no"]:
+    hookSay io,
+      HookSwitchVariable & "=" & getEnv(HookSwitchVariable) &
+        ": certificates were not propagated with this push"
+    return
+  if args.len != 2:
+    hookSay io,
+      "warning: `hook pre-push` takes the remote's name and URL, as git passes " &
+        "them; got " & $args.len & " argument(s). Certificates were not propagated."
+    return
+  var options = defaultHookOptions()
+  let timeoutText = getEnv(HookTimeoutVariable).strip()
+  if timeoutText.len > 0:
+    try:
+      let seconds = parseInt(timeoutText)
+      if seconds < 0:
+        raise newException(ValueError, "negative")
+      options.push.timeoutMs = seconds * 1000
+    except ValueError:
+      hookSay io,
+        "note: ignored " & HookTimeoutVariable & "=" & timeoutText &
+          " (not a number of seconds); using " & $DefaultHookTimeoutSeconds
+  let report =
+    prePushHook(getCurrentDir(), args[0], args[1], input, nativeRoots(), options)
+  for f in report.faults:
+    hookSay io, "note: ignored pre-push input " & f
+  for r in report.remarks:
+    hookSay io, "note: " & r
+  if report.publishRan or report.pushRan:
+    var appended, replaced: int
+    for t in report.published.trees:
+      appended += t.appended.len
+      replaced += t.replaced.len
+    var line =
+      $report.certified.len & " certified tree(s) among " & $report.introduced.len &
+      " pushed commit(s): " & $appended & " certificate(s) added to " & report.notesRef
+    if replaced > 0:
+      line.add ", " & $replaced & " replaced by a signed copy"
+    if report.pushRan and report.pushed.ok:
+      line.add "; " & $report.pushed.outcome & " to " & report.target
+    hookSay io, line
+  elif report.introduced.len > 0 and report.problems.len == 0:
+    hookSay io,
+      "no stored certificates for the " & $report.introduced.len &
+        " commit(s) this push introduces; nothing to propagate"
+  if report.problems.len > 0:
+    for p in report.problems:
+      hookSay io, "warning: " & p
+    hookSay io,
+      "warning: certificates were NOT fully propagated; the push continues. " &
+        "Retry with `test-certificates notes push " & report.target & "`."
+
+proc hookCommand(io: CliIo, args: seq[string]): int =
+  if args.len == 0:
+    return usageError(io, "hook needs a subcommand: pre-push or install")
+  let rest = args[1 ..^ 1]
+  case args[0]
+  of "pre-push":
+    # Not even a defect (an index out of range, a nil access) fails the
+    # push: `runCli` catches only `CatchableError`, and a `Defect` that
+    # escaped would end the process with status 1. The input has been read
+    # by then (`prePushCommand` reads it first). A crash that is not an
+    # exception (a signal) is left to the installed hook, which ignores the
+    # status (see `PrePushHookScript`).
+    try:
+      prePushCommand(io, rest)
+    except Exception as err: # Defect included, deliberately
+      try:
+        hookSay io,
+          "warning: internal error: " & err.msg &
+            "; certificates were not propagated, and the push continues"
+      except Exception:
+        discard
+      0
+  of "install":
+    if rest == @["--print"]:
+      io.output.write PrePushHookScript
+      return 0
+    if rest.len > 0:
+      return usageError(io, "hook install takes only --print")
+    let installed = installPrePushHook(getCurrentDir())
+    if not installed.ok:
+      io.errors.say "test-certificates: " & installed.problem
+      return 1
+    io.output.say installed.path
+    if installed.alreadyInstalled:
+      io.errors.say "already installed"
+    0
+  else:
+    usageError(io, "unknown hook subcommand " & args[0])
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -495,6 +624,8 @@ proc runCli*(args: openArray[string], io: CliIo): int =
       pruneCommand(io, rest)
     of "notes":
       notesCommand(io, rest)
+    of "hook":
+      hookCommand(io, rest)
     of "--help", "-h", "help":
       io.output.write Usage
       0
@@ -508,4 +639,5 @@ proc runCli*(args: openArray[string], io: CliIo): int =
     # I/O error writing the report, say), so the process still answers a
     # status instead of a stack trace.
     io.errors.say "test-certificates: internal error: " & err.msg
-    1
+    # Not even an unexpected error fails a push (Tooling §4).
+    if args.len >= 2 and args[0] == "hook" and args[1] == "pre-push": 0 else: 1

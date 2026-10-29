@@ -14,6 +14,8 @@
 ## ``notes import [<commit>…]``  ``importNotes``
 ## ``notes push <remote>``       ``pushNotes``
 ## ``notes fetch <remote>``      ``fetchNotes``
+## ``hook pre-push``             ``prePushHook``
+## ``hook install``              ``installPrePushHook``
 ## ============================  ==============================================
 ##
 ## Errors are returned in the result objects, never raised to the caller and
@@ -28,9 +30,9 @@
 import
   test_certificates/[
     sha256, toml, content_id, certificate, content_state, roots, put, find, prune,
-    layout, note_framing, notes,
+    layout, note_framing, notes, hook,
   ]
 
 export
   sha256, toml, content_id, certificate, content_state, roots, put, find, prune, layout,
-  note_framing, notes
+  note_framing, notes, hook

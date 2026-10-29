@@ -148,6 +148,13 @@ type
       ## applies to this one too. A caller that is ITSELF running inside a
       ## ``pre-push`` hook sets it false (``git push --no-verify``), so the
       ## notes push does not re-enter the hook (Tooling §4).
+    timeoutMs*: int
+      ## A wall-clock budget, in milliseconds, for everything the push does
+      ## over the network: every push attempt, the fetches between them and
+      ## the backoff. 0 is no limit. A git command still running when the
+      ## budget runs out is stopped (POSIX; see ``git.runProcess``) and the
+      ## push reported as failed. A ``pre-push`` hook sets one so that a
+      ## remote that does not answer cannot hold the user's push hostage.
 
 proc defaultPushOptions*(): PushOptions =
   ## Five attempts, a 100 ms backoff base, hooks run. Measured on one
@@ -655,7 +662,7 @@ proc importNotes*(
 # ---------------------------------------------------------------------------
 
 proc fetchRemoteRef(
-    r: NotesRepo, remote: string
+    r: NotesRepo, remote: string, deadline = Deadline()
 ): tuple[ok, present: bool, oid, problem: string] =
   ## The remote's notes ref, fetched into a private ref (whose objects stay
   ## after the ref is deleted). ``present`` false: the remote has none.
@@ -674,6 +681,7 @@ proc fetchRemoteRef(
         remote,
         "+" & r.notesRef & ":" & temporary,
       ],
+      timeoutMs = deadline.remainingMs,
     )
     if not fetched.started:
       return (false, false, "", fetched.failure)
@@ -683,6 +691,7 @@ proc fetchRemoteRef(
       let listed = gitRun(
         r.dir,
         ["ls-remote", "--exit-code", "--refs", "--end-of-options", remote, r.notesRef],
+        timeoutMs = deadline.remainingMs,
       )
       if listed.started and listed.exitCode == 2:
         return (true, false, "", "")
@@ -842,7 +851,7 @@ type PushVerdict = enum
   pvFailed
 
 proc pushOnce(
-    r: NotesRepo, remote, commit: string, runHooks: bool
+    r: NotesRepo, remote, commit: string, runHooks: bool, deadline = Deadline()
 ): tuple[verdict: PushVerdict, detail: string] =
   ## Push ``commit`` to the remote notes ref without force, and classify the
   ## answer from ``--porcelain`` (one ``<flag> TAB <from>:<to> TAB
@@ -861,7 +870,12 @@ proc pushOnce(
   if not runHooks:
     args.add "--no-verify"
   args.add ["--end-of-options", remote, commit & ":" & r.notesRef]
-  let run = gitRun(r.dir, args, env = [("LC_ALL", "C"), ("LANGUAGE", "")])
+  let run = gitRun(
+    r.dir,
+    args,
+    env = [("LC_ALL", "C"), ("LANGUAGE", "")],
+    timeoutMs = deadline.remainingMs,
+  )
   if not run.started:
     return (pvFailed, run.failure)
   for line in run.stdout.splitLines():
@@ -913,6 +927,7 @@ proc pushNotes*(
   ## Tooling §3 ``notes push``: push the local notes ref. When the remote ref
   ## has moved, fetch it, union-merge it into the local ref and try again,
   ## with exponential backoff and jitter, ``options.attempts`` times in all.
+  ## With ``options.timeoutMs``, all of it is bounded by that budget.
   let r = openNotesRepo(dir, notesRef)
   if not r.ok:
     result.problems.add r.problem
@@ -925,8 +940,19 @@ proc pushNotes*(
     getTime().toUnix() * 1_000_000_000 + getTime().nanosecond + getCurrentProcessId()
   )
   let attempts = max(options.attempts, 1)
+  let deadline = deadlineIn(options.timeoutMs)
+  template outOfTime(): bool =
+    if deadline.expired:
+      result.problems.add "pushing " & r.notesRef & " to " & remote &
+        " gave up: its time budget of " & $options.timeoutMs & " ms ran out"
+      true
+    else:
+      false
+
   for attempt in 1 .. attempts:
     result.attempts = attempt
+    if outOfTime():
+      return
     let current = refValue(r, r.notesRef)
     if not current.ok:
       result.problems.add current.problem
@@ -935,7 +961,7 @@ proc pushNotes*(
       result.outcome = soNoLocalNotes
       result.ok = true
       return
-    let pushed = pushOnce(r, remote, current.oid, options.runHooks)
+    let pushed = pushOnce(r, remote, current.oid, options.runHooks, deadline)
     case pushed.verdict
     of pvAccepted:
       result.outcome = soPushed
@@ -962,8 +988,13 @@ proc pushNotes*(
       # lost the same round would otherwise sleep alike and race again in
       # lockstep, one winning per round.
       if options.baseDelayMs > 0:
-        sleep(rng.rand(options.baseDelayMs * (1 shl (attempt - 1))))
-      let fetched = fetchRemoteRef(r, remote)
+        var pause = rng.rand(options.baseDelayMs * (1 shl (attempt - 1)))
+        if deadline.limited:
+          pause = min(pause, deadline.remainingMs)
+        sleep(pause)
+      if outOfTime():
+        return
+      let fetched = fetchRemoteRef(r, remote, deadline)
       if not fetched.ok:
         result.problems.add fetched.problem
         return
