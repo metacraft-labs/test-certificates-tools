@@ -5,23 +5,24 @@
 ## -z``, ``cat-file --batch``) that must not have warnings mixed into it, and
 ## some of them feed git a large standard input while it writes a large
 ## standard output (``cat-file --batch``). Writing all of the input before
-## reading any output deadlocks as soon as both exceed a pipe buffer, so on
-## POSIX the three pipes are serviced together with ``poll(2)``. No shell is
-## involved anywhere: arguments reach git exactly as given.
-##
-## Windows has no ``poll`` over anonymous pipes; there the input is written
-## first, then stdout and stderr are drained in turn. The recipes in this
-## package keep each input small enough (one blob per ``cat-file`` request
-## there) that this cannot block.
+## reading any output deadlocks as soon as both exceed a pipe buffer, so the
+## three pipes are serviced together: with ``poll(2)`` on POSIX, with
+## overlapped I/O and ``WaitForMultipleObjects`` on Windows
+## (``windows_process``). No shell is involved anywhere: arguments reach git
+## exactly as given.
 
 import std/[monotimes, os, strtabs, strutils, times]
 
 when defined(windows):
-  import std/[osproc, streams]
+  import ./windows_process
 else:
   import std/posix
 
 type
+  OutputSink* = proc(data: openArray[char]): bool {.closure.}
+    ## Receives a process's standard output piece by piece as it arrives
+    ## (``runProcess(onStdout = …)``); answers false to stop the process.
+
   GitRun* = object
     started*: bool ## False when git could not be run at all.
     exitCode*: int
@@ -32,6 +33,9 @@ type
       ## It ran past its time limit and was stopped. ``started`` is then
       ## false and ``failure`` says so, so every caller that handles "could
       ## not run" handles this too.
+    stopped*: bool
+      ## The ``onStdout`` sink asked to stop, and the process was stopped.
+      ## ``started`` is then false, as for ``timedOut``.
 
   Deadline* = object
     ## A point in time by which a sequence of commands must be done, or no
@@ -62,11 +66,20 @@ proc remainingMs*(d: Deadline): int =
   max(1, int((d.at - getMonoTime()).inMilliseconds))
 
 proc childEnvironment(overrides: openArray[(string, string)]): StringTableRef =
-  result = newStringTable(modeCaseSensitive)
+  ## This process's environment with ``overrides`` applied. Names are
+  ## case-insensitive on Windows (``Path`` and ``PATH`` are one variable), so
+  ## an override there replaces the variable whatever its spelling.
+  result =
+    newStringTable(when defined(windows): modeCaseInsensitive else: modeCaseSensitive)
   for key, value in envPairs():
     result[key] = value
   for (key, value) in overrides:
     result[key] = value
+
+when defined(windows):
+  proc environmentPairs(table: StringTableRef): seq[(string, string)] =
+    for key, value in table:
+      result.add (key, value)
 
 when not defined(windows):
   proc writeWithoutSigpipe(fd: cint, data: pointer, len: int): int =
@@ -109,8 +122,11 @@ when not defined(windows):
   # which detaches and redirects its standard streams, still holds our
   # stdout and stderr pipes open, so reading them to the end waits for it to
   # exit — a push that hangs on a background process the user never sees.
-  # Here every pipe end is close-on-exec, and only the `dup2`ed copies on 0,
-  # 1 and 2 (which `dup2` makes inheritable) reach the child.
+  # Here every pipe end is close-on-exec, only the `dup2`ed copies on 0, 1
+  # and 2 (which `dup2` makes inheritable) reach the child, and the child
+  # closes every other descriptor before `execve` (`closeOtherDescriptors`),
+  # so not even one the program linking this library opened without
+  # close-on-exec is passed on.
   #
   # `fork` + `execve` rather than `posix_spawn`: the child must start in
   # `cwd`, and `posix_spawn_file_actions_addchdir_np` is missing from the
@@ -176,8 +192,52 @@ when not defined(windows):
       path, cwd: cstring
       argv, envp: cstringArray
       stdinFd, stdoutFd, stderrFd, reportFd: cint
+      ownSession: bool ## Start a new session (and process group) first.
+      parent: Pid ## This process, to notice having been orphaned already.
+      maxFd: cint ## Descriptors below this are closed in the child (3 and up).
+
+  when defined(linux):
+    const PrSetPdeathsig = cint(1) ## prctl(2) option.
+    proc prctl(
+      option: cint, arg: culong
+    ): cint {.importc, header: "<sys/prctl.h>", varargs.}
+
+  when defined(linux):
+    const SysCloseRange = clong(436)
+      ## close_range(2); the same on every Linux architecture.
+    proc syscall(number: clong): clong {.importc, header: "<unistd.h>", varargs.}
+
+  const DescriptorLimitCap = 65536
+    ## The most descriptors closed one by one where close_range(2) is missing.
+
+  proc descriptorLimit(): cint =
+    ## One above the highest descriptor this process can have open (its
+    ## RLIMIT_NOFILE soft limit), capped at ``DescriptorLimitCap``.
+    var limit: RLimit
+    if getrlimit(RLIMIT_NOFILE, limit) != 0 or limit.rlim_cur <= 0 or
+        limit.rlim_cur > DescriptorLimitCap:
+      return DescriptorLimitCap
+    cint(limit.rlim_cur)
 
   {.push stackTrace: off, profiler: off.}
+  proc closeOtherDescriptors(keep, limit: cint) =
+    ## In the forked child: close every descriptor from 3 up, except ``keep``
+    ## (the close-on-exec report pipe), so the program receives its three
+    ## standard streams and nothing else this process had open without
+    ## close-on-exec — the guarantee the Windows handle list gives there.
+    ## close_range(2) (Linux 5.9) in two calls around ``keep``; otherwise, or
+    ## where it is refused, one ``close`` per possible descriptor.
+    ## https://man7.org/linux/man-pages/man2/close_range.2.html
+    when defined(linux):
+      if (keep <= 3 or syscall(SysCloseRange, cuint(3), cuint(keep - 1), cuint(0)) == 0) and
+          syscall(SysCloseRange, cuint(keep + 1), high(cuint), cuint(0)) == 0:
+        return
+    var fd: cint = 3
+    while fd < limit:
+      if fd != keep:
+        discard close(fd)
+      inc fd
+
   proc runChild(plan: ptr ChildPlan) {.noreturn.} =
     ## The forked child, up to ``execve``: async-signal-safe calls only, no
     ## allocation. A failure is written to ``reportFd`` as an errno.
@@ -189,8 +249,21 @@ when not defined(windows):
     if dup2(plan.stdinFd, 0) < 0 or dup2(plan.stdoutFd, 1) < 0 or
         dup2(plan.stderrFd, 2) < 0:
       fail()
+    closeOtherDescriptors(plan.reportFd, plan.maxFd)
     if plan.cwd[0] != '\0' and chdir(plan.cwd) < 0:
       fail()
+    if plan.ownSession:
+      # Its own session and process group, so that stopping it reaches every
+      # process it started (see `runProcess`).
+      if setsid() < 0:
+        fail()
+      when defined(linux):
+        # SIGKILL when the thread that started it dies; if that already
+        # happened, it would never be delivered.
+        if prctl(PrSetPdeathsig, culong(SIGKILL)) < 0:
+          fail()
+        if getppid() != plan.parent:
+          exitnow(127)
     # No signal blocked (this thread may be blocking SIGPIPE, see
     # `writeWithoutSigpipe`), and SIGPIPE at its default, which an ignored
     # disposition here would otherwise pass on through `execve`.
@@ -204,7 +277,11 @@ when not defined(windows):
   {.pop.}
 
   proc spawnPiped(
-      exe: string, args: openArray[string], cwd: string, env: StringTableRef
+      exe: string,
+      args: openArray[string],
+      cwd: string,
+      env: StringTableRef,
+      ownSession = false,
   ): Spawned =
     ## Start ``exe`` (searched on ``PATH`` when it has no slash) with its
     ## standard streams on fresh pipes, in ``cwd``, with exactly ``env``.
@@ -246,6 +323,9 @@ when not defined(windows):
       stdoutFd: outPipe[1],
       stderrFd: errPipe[1],
       reportFd: report[1],
+      ownSession: ownSession,
+      parent: getpid(),
+      maxFd: descriptorLimit(),
     )
     let pid = fork()
     if pid == 0:
@@ -296,6 +376,86 @@ when not defined(windows):
         continue
       return (false, 0)
 
+when not defined(windows):
+  const
+    ForwardedSignals = [SIGINT, SIGTERM, SIGHUP]
+      ## Signals that end this process by default and that a terminal or a
+      ## supervisor sends to stop it. While a child of its own session runs,
+      ## they are held and passed on to that child's group first.
+    InterruptPollMs = 100
+      ## How often a pending forwarded signal is looked for while the child
+      ## runs (``poll`` is not woken by a blocked signal).
+    StopGraceMs = 1000 ## Between the first signal to a stopped child and SIGKILL.
+
+  when defined(linux):
+    var
+      cWEXITED {.importc: "WEXITED", header: "<sys/wait.h>".}: cint
+      cWNOWAIT {.importc: "WNOWAIT", header: "<sys/wait.h>".}: cint
+      cP_PID {.importc: "P_PID", header: "<sys/wait.h>".}: cint
+    proc waitid(
+      idtype: cint, id: Id, info: var SigInfo, options: cint
+    ): cint {.importc, header: "<sys/wait.h>".}
+
+  proc exitedUnreaped(pid: Pid): tuple[known, exited: bool] =
+    ## Whether the child has exited, WITHOUT reaping it: its pid (and so its
+    ## process-group id) stays allocated to the zombie until ``reap``.
+    ## ``known`` false where that cannot be asked (not Linux).
+    ## https://man7.org/linux/man-pages/man2/waitid.2.html
+    when defined(linux):
+      while true:
+        var info: SigInfo
+        zeroMem(addr info, sizeof(info))
+        if waitid(cP_PID, Id(pid), info, cWEXITED or WNOHANG or cWNOWAIT) == 0:
+          return (true, info.si_pid == pid)
+        if errno != EINTR:
+          return (false, false)
+    else:
+      (false, false)
+
+  proc stopChild(
+      pid: Pid, group: bool, first: cint, reaped: var bool, status: var cint
+  ) =
+    ## Send ``first`` to the child (to its whole process group with
+    ## ``group``), wait up to ``StopGraceMs`` for it to exit, then SIGKILL,
+    ## and reap it. With ``group``, what is left of the group gets SIGKILL
+    ## too: helpers that outlive their ``git`` still hold its pipes past the
+    ## budget. The group id is the child's pid (it is a session leader). That
+    ## last SIGKILL is sent while the child is not yet reaped where that can
+    ## be told (Linux, ``exitedUnreaped``), so the id cannot have been reused
+    ## by a stranger; elsewhere it follows the reap, and POSIX does not reuse
+    ## a pid while a process group of that id still has members.
+    let target =
+      if group:
+        Pid(-pid)
+      else:
+        pid
+    if reaped:
+      return
+    discard kill(target, first)
+    let graceEnds = deadlineIn(StopGraceMs)
+    while not reaped and not graceEnds.expired:
+      let peek = exitedUnreaped(pid)
+      if peek.known:
+        if peek.exited:
+          break
+        sleep(10)
+        continue
+      let exited = reap(pid, WNOHANG)
+      if exited.done:
+        reaped = true
+        status = exited.status
+      else:
+        sleep(10)
+    if not reaped:
+      # The child, alive or a zombie, still holds its pid and group id.
+      discard kill(target, SIGKILL)
+      status = reap(pid, 0).status
+      reaped = true
+    elif group:
+      # Reaped already (not Linux): only the group's remaining members can
+      # hold the id now.
+      discard kill(target, SIGKILL)
+
 proc runProcess*(
     exe: string,
     args: openArray[string],
@@ -303,56 +463,98 @@ proc runProcess*(
     env: openArray[(string, string)] = [],
     input = "",
     timeoutMs = 0,
+    onStdout: OutputSink = nil,
 ): GitRun =
   ## Run ``exe`` with ``args`` in ``cwd``. ``env`` is added to (and overrides)
   ## this process's environment; nothing else is changed.
   ##
-  ## On POSIX the child receives its three standard streams and no other
-  ## descriptor of this process (see ``spawnPiped``), so a process it leaves
-  ## running in the background holds our pipes open only if it keeps its
-  ## own standard streams.
+  ## The child receives its three standard streams and no other handle or
+  ## descriptor of this process (POSIX: ``spawnPiped``; Windows:
+  ## ``windows_process``), so a process it leaves running in the background
+  ## holds our pipes open only if it keeps its own standard streams.
   ##
-  ## With ``timeoutMs`` > 0 (POSIX only; ignored on Windows, whose drain is
-  ## blocking), a process still running after that many milliseconds is sent
-  ## SIGTERM, then SIGKILL a second later, and the run is answered as
-  ## ``timedOut``. Its output pipes are not drained after that: a child it
-  ## started (``ssh``, a credential helper) may still hold them open.
+  ## ``onStdout``, when given, receives standard output as it arrives instead
+  ## of ``stdout`` collecting it, so output of any size is processed in
+  ## bounded memory. When it answers false the child is stopped and the run
+  ## answered as ``stopped``.
+  ##
+  ## With ``timeoutMs`` > 0, a process still running after that many
+  ## milliseconds is stopped together with everything it started, and the
+  ## run is answered as ``timedOut``. Its output pipes are not drained after
+  ## that: a helper it started (``ssh``, a credential helper) may still hold
+  ## them open. A process that had already exited when the time ran out
+  ## keeps its own answer.
+  ##
+  ## * POSIX: the child is started in a session of its own (``setsid``), and
+  ##   is stopped with SIGTERM to its process group, then SIGKILL a second
+  ##   later. While it runs, SIGINT, SIGTERM and SIGHUP (those the calling
+  ##   thread does not already block) are held in this thread; one that
+  ##   arrives is sent to the child's group, the group is stopped as above,
+  ##   and the signal is then released to take its usual effect here — so a
+  ##   Ctrl-C that interrupts a push does not leave the hook's ``git`` and
+  ##   ``ssh`` running, unseen, after it. If the handler of the program
+  ##   linking this library returns, the run is answered as interrupted. On
+  ##   Linux the child also gets SIGKILL if this thread dies
+  ##   (``PR_SET_PDEATHSIG``), for the deaths no handler sees. The new
+  ##   session has no controlling terminal: a helper that would prompt on
+  ##   ``/dev/tty`` (``ssh`` asking for a passphrase) fails at once and is
+  ##   reported, instead of stopping on SIGTTIN in a background process group
+  ##   until the budget is spent; ``GIT_TERMINAL_PROMPT=0`` already forbids
+  ##   git's own prompts on every run.
+  ## * Windows: the child runs in a Job Object, stopped with
+  ##   ``TerminateJobObject``; see ``windows_process``.
+  ##
+  ## Without a time limit the child stays in this process's session and
+  ## process group, so a terminal's Ctrl-C reaches it directly and it may
+  ## prompt on the terminal as before.
   when defined(windows):
-    var p: Process
-    try:
-      p = startProcess(
-        exe,
-        workingDir = cwd,
-        args = args,
-        env = childEnvironment(env),
-        options = {poUsePath},
-      )
-    except OSError as err:
-      return GitRun(failure: "could not run " & exe & ": " & err.msg)
-    result.started = true
-    try:
-      let ins = p.inputStream
-      if input.len > 0:
-        ins.write(input)
-      ins.close()
-      result.stdout = p.outputStream.readAll()
-      result.stderr = p.errorStream.readAll()
-      result.exitCode = p.waitForExit()
-    except CatchableError as err:
-      result.started = false
-      result.failure = "talking to " & exe & " failed: " & err.msg
-      try:
-        p.terminate()
-        discard p.waitForExit()
-      except CatchableError:
-        discard
-    finally:
-      p.close()
+    let ran = runWindowsProcess(
+      exe,
+      args,
+      cwd,
+      environmentPairs(childEnvironment(env)),
+      input,
+      timeoutMs,
+      onStdout,
+    )
+    GitRun(
+      started: ran.started,
+      exitCode: ran.exitCode,
+      stdout: ran.stdout,
+      stderr: ran.stderr,
+      failure: ran.failure,
+      timedOut: ran.timedOut,
+      stopped: ran.stopped,
+    )
   else:
+    let timed = timeoutMs > 0
+    # The forwarded signals this thread does not block already: held from
+    # BEFORE the fork, so one that arrives while the child is being started
+    # is not lost with the child left running (it is forwarded as soon as
+    # the child's pid is known), and released (and so delivered) in
+    # `finally`. The child unblocks every signal before `execve`, and a
+    # forked child starts with no signal pending.
+    var watched: Sigset
+    var savedMask: Sigset
+    var watching = false
+    discard sigemptyset(watched)
+    if timed:
+      var none: Sigset
+      discard sigemptyset(none)
+      discard pthread_sigmask(SIG_BLOCK, none, savedMask)
+      for s in ForwardedSignals:
+        if sigismember(savedMask, s) != 1:
+          discard sigaddset(watched, s)
+          watching = true
+      if watching:
+        discard pthread_sigmask(SIG_BLOCK, watched, none)
     var child: Spawned
     try:
-      child = spawnPiped(exe, args, cwd, childEnvironment(env))
+      child = spawnPiped(exe, args, cwd, childEnvironment(env), ownSession = timed)
     except OSError as err:
+      if watching:
+        var unused: Sigset
+        discard pthread_sigmask(SIG_SETMASK, savedMask, unused)
       return GitRun(failure: "could not run " & exe & ": " & err.msg)
     result.started = true
     var inFd = child.stdinFd
@@ -360,6 +562,7 @@ proc runProcess*(
     var errFd = child.stderrFd
     var reaped = false
     var status: cint = 0
+    var interruptedBy: cint = 0
     try:
       var written = 0
       if input.len == 0:
@@ -369,83 +572,107 @@ proc runProcess*(
         discard fcntl(inFd, F_SETFL, fcntl(inFd, F_GETFL) or O_NONBLOCK)
       var buffer = newString(65536)
       let deadline = deadlineIn(timeoutMs)
-      while inFd >= 0 or outFd >= 0 or errFd >= 0:
-        if deadline.expired:
-          result.timedOut = true
-          break
-        var fds: seq[TPollfd]
-        if inFd >= 0:
-          fds.add TPollfd(fd: inFd, events: POLLOUT)
-        if outFd >= 0:
-          fds.add TPollfd(fd: outFd, events: POLLIN)
-        if errFd >= 0:
-          fds.add TPollfd(fd: errFd, events: POLLIN)
-        let wait = if deadline.limited: deadline.remainingMs else: -1
-        let ready = poll(addr fds[0], Tnfds(fds.len), cint(wait))
-        if ready < 0:
-          if errno == EINTR:
-            continue
-          raiseOSError(osLastError(), "poll")
-        for f in fds:
-          if f.revents == 0:
-            continue
-          if f.fd == inFd:
-            if (f.revents and (POLLERR or POLLHUP)) != 0:
-              # The child stopped reading: its exit status says why.
-              discard close(inFd)
-              inFd = -1
+      block pump:
+        while inFd >= 0 or outFd >= 0 or errFd >= 0:
+          if watching:
+            var pending: Sigset
+            discard sigpending(pending)
+            for s in ForwardedSignals:
+              if sigismember(watched, s) == 1 and sigismember(pending, s) == 1:
+                interruptedBy = s
+                break pump
+          if deadline.expired:
+            result.timedOut = true
+            break
+          var fds: seq[TPollfd]
+          if inFd >= 0:
+            fds.add TPollfd(fd: inFd, events: POLLOUT)
+          if outFd >= 0:
+            fds.add TPollfd(fd: outFd, events: POLLIN)
+          if errFd >= 0:
+            fds.add TPollfd(fd: errFd, events: POLLIN)
+          var wait = if deadline.limited: deadline.remainingMs else: -1
+          if watching:
+            wait = min(wait, InterruptPollMs)
+          let ready = poll(addr fds[0], Tnfds(fds.len), cint(wait))
+          if ready < 0:
+            if errno == EINTR:
               continue
-            let n =
-              writeWithoutSigpipe(inFd, unsafeAddr input[written], input.len - written)
-            if n < 0:
-              if errno in [EAGAIN, EWOULDBLOCK, EINTR]:
-                continue
-              if errno == EPIPE:
+            raiseOSError(osLastError(), "poll")
+          for f in fds:
+            if f.revents == 0:
+              continue
+            if f.fd == inFd:
+              if (f.revents and (POLLERR or POLLHUP)) != 0:
+                # The child stopped reading: its exit status says why.
                 discard close(inFd)
                 inFd = -1
                 continue
-              raiseOSError(osLastError(), "write to " & exe)
-            written += n
-            if written >= input.len:
-              discard close(inFd)
-              inFd = -1
-          else:
-            let n = read(f.fd, addr buffer[0], buffer.len)
-            if n < 0:
-              if errno in [EAGAIN, EINTR]:
-                continue
-              raiseOSError(osLastError(), "read from " & exe)
-            if n == 0:
-              discard close(f.fd)
-              if f.fd == outFd:
-                outFd = -1
-              else:
-                errFd = -1
-            elif f.fd == outFd:
-              result.stdout.add buffer[0 ..< n]
+              let n = writeWithoutSigpipe(
+                inFd, unsafeAddr input[written], input.len - written
+              )
+              if n < 0:
+                if errno in [EAGAIN, EWOULDBLOCK, EINTR]:
+                  continue
+                if errno == EPIPE:
+                  discard close(inFd)
+                  inFd = -1
+                  continue
+                raiseOSError(osLastError(), "write to " & exe)
+              written += n
+              if written >= input.len:
+                discard close(inFd)
+                inFd = -1
             else:
-              result.stderr.add buffer[0 ..< n]
+              let n = read(f.fd, addr buffer[0], buffer.len)
+              if n < 0:
+                if errno in [EAGAIN, EINTR]:
+                  continue
+                raiseOSError(osLastError(), "read from " & exe)
+              if n == 0:
+                discard close(f.fd)
+                if f.fd == outFd:
+                  outFd = -1
+                else:
+                  errFd = -1
+              elif f.fd == outFd:
+                if onStdout != nil:
+                  if not onStdout(buffer.toOpenArray(0, n - 1)):
+                    result.stopped = true
+                    break pump
+                else:
+                  result.stdout.add buffer[0 ..< n]
+              else:
+                result.stderr.add buffer[0 ..< n]
+      if interruptedBy != 0:
+        stopChild(child.pid, timed, interruptedBy, reaped, status)
+        result.started = false
+        result.exitCode = -1
+        result.failure =
+          exe & " was stopped: this process received signal " & $interruptedBy
+        return
+      if result.stopped:
+        stopChild(child.pid, timed, SIGTERM, reaped, status)
+        result.started = false
+        result.exitCode = -1
+        result.failure = exe & " was stopped: its output was no longer wanted"
+        return
       if result.timedOut:
+        # It exited; a helper it left behind holds the pipes open past the
+        # budget, and is ended — before the reap where that can be told
+        # (see `stopChild`). Its own answer stands.
+        let peek = exitedUnreaped(child.pid)
+        if peek.known and peek.exited:
+          discard kill(Pid(-child.pid), SIGKILL)
         let exited = reap(child.pid, WNOHANG)
         if exited.done:
-          # It exited; a child it left behind holds the pipes open. Its own
-          # answer stands.
           result.timedOut = false
           reaped = true
           status = exited.status
+          if not peek.known:
+            discard kill(Pid(-child.pid), SIGKILL)
       if result.timedOut:
-        discard kill(child.pid, SIGTERM)
-        let graceEnds = deadlineIn(1000)
-        while not reaped and not graceEnds.expired:
-          let exited = reap(child.pid, WNOHANG)
-          if exited.done:
-            reaped = true
-          else:
-            sleep(10)
-        if not reaped:
-          discard kill(child.pid, SIGKILL)
-          discard reap(child.pid, 0)
-          reaped = true
+        stopChild(child.pid, timed, SIGTERM, reaped, status)
         result.started = false
         result.exitCode = -1
         result.failure =
@@ -459,12 +686,15 @@ proc runProcess*(
       result.started = false
       result.failure = "talking to " & exe & " failed: " & err.msg
       if not reaped:
-        discard kill(child.pid, SIGKILL)
-        discard reap(child.pid, 0)
+        stopChild(child.pid, timed, SIGKILL, reaped, status)
     finally:
       for fd in [inFd, outFd, errFd]:
         if fd >= 0:
           discard close(fd)
+      if watching:
+        # A held signal is delivered here, with the child already stopped.
+        var unused: Sigset
+        discard pthread_sigmask(SIG_SETMASK, savedMask, unused)
 
 const PathspecEnvironment* = [
   # Scope paths are passed with `--literal-pathspecs` (Content-Id §4.1:
@@ -491,6 +721,7 @@ proc gitRun*(
     input = "",
     env: openArray[(string, string)] = [],
     timeoutMs = 0,
+    onStdout: OutputSink = nil,
 ): GitRun =
   ## Run ``git <args>`` in ``cwd`` and answer everything it did: its exit
   ## status, stdout and stderr, apart. For the callers that must tell one
@@ -509,7 +740,7 @@ proc gitRun*(
     argv.add ["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"]
   environment.add env
   argv.add args
-  runProcess("git", argv, cwd, environment, input, timeoutMs)
+  runProcess("git", argv, cwd, environment, input, timeoutMs, onStdout)
 
 proc git*(
     cwd: string,
