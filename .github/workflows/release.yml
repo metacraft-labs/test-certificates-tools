@@ -1,0 +1,32 @@
+name: Release
+
+# Publishes a GitHub release when a `v<version>` tag is pushed. The tag must
+# equal the version in test_certificates.nimble and point at a commit on
+# `stable` (the branching policy's release rule); the shared release workflow
+# refuses a tag that disagrees with the version file. `workflow_dispatch`
+# runs every build, package and portability step without publishing, as a
+# rehearsal before tagging.
+#
+# What runs (metacraft-labs/metacraft-github-actions, release-tools.yml):
+# plan from .github/release.json -> build each target in this flake's
+# `release` shell (scripts/release/build.sh; build.ps1 on Windows) -> verify
+# the payload and run scripts/release/smoke.cjs against the archive -> on
+# Linux, install the .deb and .rpm in clean distribution containers and smoke
+# them again -> sign the checksum manifest -> publish (tag pushes only).
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    uses: metacraft-labs/metacraft-github-actions/.github/workflows/release-tools.yml@96ac63b99d8d6c3a06ca43a9214abbc00f4ac01e
+    with:
+      tooling-ref: 96ac63b99d8d6c3a06ca43a9214abbc00f4ac01e
+      nix-shell: release
+    secrets: inherit

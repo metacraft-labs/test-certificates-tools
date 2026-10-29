@@ -1,0 +1,7 @@
+# Adds to the workspace's EditorConfig. .gitattributes keeps every text file
+# LF on every platform (certificates and canonical payloads are byte-exact),
+# PowerShell scripts included; PowerShell reads LF scripts.
+root = false
+
+[*.{ps1,psm1,psd1}]
+end_of_line = lf

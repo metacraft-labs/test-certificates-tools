@@ -1,0 +1,237 @@
+name: CI
+
+# Runs on the product mainline and on pull requests into it (and into
+# `stable`), never on `agents`: work reaches `dev` through a promotion pull
+# request, whose checks are these.
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev, stable]
+  pull_request:
+    branches: [dev, stable]
+
+# Cancel superseded PR runs only; every other event gets a group unique to its
+# run, so it is never cancelled and never cancels anything.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Coverage: the three Nix legs (Linux x64, Linux arm64, macOS arm64) and a
+# Windows x64 leg without Nix (scripts/windows/test.ps1). `put --system` is
+# deliberately unsupported on Windows (see docs/users/README.md); its tests
+# are POSIX-only, each marked in its file.
+
+jobs:
+  choose-linux:
+    # Public repository: free GitHub-hosted runners unless CI_RUNNER_MODE says
+    # otherwise, with the self-hosted capability labels as the fallback.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
+  choose-macos:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
+  choose-linux-arm64:
+    # GitHub's free hosted ARM runner for this public repository. The
+    # self-hosted `[self-hosted, linux, arm64]` pool is the fallback; it is
+    # disabled in the central GARM today (infra central-garm.nix, 2026-10-09),
+    # so without a hosted preference this leg queued with no runner at all.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04-arm
+      fallback: '["self-hosted","linux","arm64"]'
+
+  lint:
+    needs: choose-linux
+    name: Lint
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Dev Environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        with:
+          env-flavor: nix
+          # The nix flavor refuses an empty token. Every flake input of this
+          # public repository is public, so the job's own token suffices.
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run lint
+        # `shell: bash` selects `-eo pipefail`, without which `| tee` would
+        # report tee's status and hide a failing `just`.
+        shell: bash
+        run: dev-exec just lint 2>&1 | tee lint.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-logs
+          path: lint.log
+          retention-days: 7
+
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        with:
+          path: lint.log
+          prefix: lint-logs/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
+
+  test:
+    needs: [choose-linux, choose-macos, choose-linux-arm64]
+    name: Test (${{ matrix.slug }})
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.slug == 'linux-arm64' && fromJSON(needs.choose-linux-arm64.outputs.runs_on) || matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
+          - slug: linux-arm64
+            runs-on: [self-hosted, linux, arm64]
+          - slug: macos-arm64
+            runs-on: [self-hosted, macos, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The conformance test reads the specification's vectors at the commit
+      # tests/spec-vectors.pin names, from git's object store, so the clone
+      # needs full history rather than a shallow tip.
+      - name: Checkout the specification (for its conformance vectors)
+        uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/test-certificates-spec
+          path: .ci/test-certificates-spec
+          fetch-depth: 0
+
+      - name: Setup Dev Environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        with:
+          env-flavor: nix
+          # The nix flavor refuses an empty token. Every flake input of this
+          # public repository is public, so the job's own token suffices.
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run tests
+        shell: bash
+        env:
+          TEST_CERTIFICATES_SPEC_DIR: ${{ github.workspace }}/.ci/test-certificates-spec
+        run: dev-exec just test 2>&1 | tee test.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.slug }}
+          path: test.log
+          retention-days: 7
+
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        with:
+          path: test.log
+          prefix: test-logs-${{ matrix.slug }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
+
+  test-windows:
+    name: Test (windows-x64)
+    # The persistent Windows runners (the ephemeral Windows pool is disabled):
+    # `dev-env-ready` because the job uses the shared DIY toolchain those
+    # runners carry (nim, WinLibs gcc, Git for Windows). There is no Nix on
+    # Windows, so the suite runs through scripts/windows/test.ps1, the
+    # equivalent of `just test`.
+    runs-on: [self-hosted, windows, x64, dev-env-ready]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout the specification (for its conformance vectors)
+        uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/test-certificates-spec
+          path: .ci/test-certificates-spec
+          fetch-depth: 0
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          # The PATH `gcc` on these runners is not the provisioned toolchain;
+          # the profile installs WinLibs GCC per service account. Put it first.
+          $gccRoots = @(
+            "$env:LOCALAPPDATA\repo-workspaces\toolchains\gcc",
+            'C:\Windows\ServiceProfiles\NetworkService\AppData\Local\repo-workspaces\toolchains\gcc',
+            'C:\Windows\System32\config\systemprofile\AppData\Local\repo-workspaces\toolchains\gcc'
+          )
+          $gccBin = $null
+          foreach ($r in $gccRoots) {
+            if (Test-Path $r) {
+              $cand = Get-ChildItem $r -Directory | Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName 'bin' } |
+                Where-Object { Test-Path (Join-Path $_ 'gcc.exe') } | Select-Object -First 1
+              if ($cand) { $gccBin = $cand; break }
+            }
+          }
+          if (-not $gccBin) { throw "no provisioned WinLibs gcc found under: $($gccRoots -join ', ')" }
+          $env:PATH = "$gccBin;$env:PATH"
+          ./scripts/windows/test.ps1 -SpecDir .ci/test-certificates-spec 2>&1 | Tee-Object test.log
+          if (-not $?) { throw "the Windows test suite failed" }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-windows-x64
+          path: test.log
+          retention-days: 7
+
+  nix-build:
+    needs: [choose-linux, choose-macos]
+    name: Nix build (${{ matrix.slug }})
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || fromJSON(needs.choose-linux.outputs.runs_on) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        slug: [linux-x64, macos-arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Dev Environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        with:
+          env-flavor: nix
+          # The nix flavor refuses an empty token. Every flake input of this
+          # public repository is public, so the job's own token suffices.
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: nix build
+        shell: bash
+        run: nix build --print-build-logs .#default 2>&1 | tee nix-build.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-build-logs-${{ matrix.slug }}
+          path: nix-build.log
+          retention-days: 7
