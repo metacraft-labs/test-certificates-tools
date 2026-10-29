@@ -77,7 +77,9 @@ proc beingWritten(dir: string, now: Time, noFollow = false): bool =
   except OSError:
     return true
   try:
-    for kind, path in walkDir(dir, checkDir = true):
+    # The extended form, so a temporary record's path past MAX_PATH can still
+    # be dated: an undatable one would count as a write forever.
+    for kind, path in walkDir(extendedTreePath(dir), checkDir = true):
       if isTemporaryName(path.extractFilename):
         if noFollow and kind in {pcLinkToDir, pcLinkToFile}:
           continue # A symbolic link is not a writer's temporary record.
@@ -325,7 +327,7 @@ proc pruneRoot*(
                 else:
                   removeDir(digestPath)
               else:
-                removeDir(extendedPath(digestPath))
+                removeDir(extendedTreePath(digestPath))
               result.leftovers.add root / LayoutVersion / algorithmPath.extractFilename /
                 name
             except OSError as err:
@@ -405,7 +407,7 @@ proc pruneRoot*(
         else:
           removeDir(aside)
       else:
-        removeDir(extendedPath(aside))
+        removeDir(extendedTreePath(aside))
     except OSError as err:
       result.errors.add "'" & aside &
         "' could not be removed (a later prune deletes it): " & err.msg

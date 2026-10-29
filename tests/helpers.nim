@@ -55,7 +55,7 @@ proc cleanup*(dir: string) =
       discard
   try:
     setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
-    removeDir(dir)
+    removeDir(extendedTreePath(dir)) # records can pass MAX_PATH on Windows
   except OSError:
     discard
 

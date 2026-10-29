@@ -59,6 +59,29 @@ proc isTemporaryName*(name: string): bool =
 const LongPathThreshold = 240
   ## Below MAX_PATH (260) with room for what Windows appends internally.
 
+proc extendedTreePath*(dir: string): string =
+  ## ``dir`` in the extended-length form whatever its own length (see
+  ## ``extendedPath`` for the forms), for an operation that descends into it:
+  ## removing or listing a directory. The paths such an operation builds
+  ## beneath ``dir`` are longer than ``dir`` itself, so ``dir`` fitting under
+  ## MAX_PATH says nothing about them. A content directory renamed aside for
+  ## removal is the case in point: under an ordinary root the directory fits
+  ## and the record inside it does not, and ``std/os.removeFile`` reports the
+  ## resulting "path not found" as success, so the directory is left non-empty.
+  ## A path that is relative, or already extended, is returned unchanged, and
+  ## so is every path on POSIX.
+  when defined(windows):
+    if dir.startsWith(r"\\?\"):
+      return dir
+    let native = dir.replace('/', '\\')
+    if native.len >= 3 and native[1] == ':' and native[2] == '\\':
+      return r"\\?\" & normalizedPath(native)
+    if native.startsWith(r"\\") and not native.startsWith(r"\\.\"):
+      return r"\\?\UNC\" & normalizedPath(native[2 .. ^1])
+    dir
+  else:
+    dir
+
 proc extendedPath*(path: string): string =
   ## ``path`` in a form every file API accepts at any length. On Windows a
   ## record's path is long by construction (``<root>\v1\<algorithm>\`` with a
@@ -72,13 +95,6 @@ proc extendedPath*(path: string): string =
   ## unchanged.
   ## https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
   when defined(windows):
-    if path.len < LongPathThreshold or path.startsWith(r"\\?\"):
+    if path.len < LongPathThreshold:
       return path
-    let native = path.replace('/', '\\')
-    if native.len >= 3 and native[1] == ':' and native[2] == '\\':
-      return r"\\?\" & normalizedPath(native)
-    if native.startsWith(r"\\") and not native.startsWith(r"\\.\"):
-      return r"\\?\UNC\" & normalizedPath(native[2 .. ^1])
-    path
-  else:
-    path
+  extendedTreePath(path)

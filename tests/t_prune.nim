@@ -525,3 +525,36 @@ suite "prune":
     check pruned.leftovers == @[aside]
     check pruned.removed.len == 0 # the fresh directory is being written into
     check not dirExists(aside)
+
+  test "a content directory whose records pass MAX_PATH is removed whole":
+    # Windows: the directory renamed aside for removal fits under MAX_PATH
+    # (260) while the record inside it does not. Removing the tree by the
+    # directory's own (short) path built the record's path in the plain form,
+    # which Windows cannot resolve, and `removeFile` reported that as success:
+    # the directory was left behind, non-empty, and the prune failed. The root
+    # is sized so the renamed-aside directory lands well inside that window;
+    # on POSIX the same layout must simply be pruned.
+    let dir = scratchDir()
+    defer:
+      cleanup(dir)
+    let digest = repeat('7', 64)
+    let id = "git-tree-sha256:" & digest
+    const asideTarget = 205 # within [190, 240): fits; its record (+70) does not
+    let suffix = removalName(digest).len # the renamed-aside name's length
+    let rootLen = asideTarget - suffix - len("/v1/git-tree-sha256/")
+    let padLen = rootLen - dir.len - 1
+    require padLen >= 1 # the scratch directory leaves room for the layout
+    let root = dir / repeat('p', padLen)
+    let stored = putCertificate(root, certificateText(id))
+    require stored.ok
+    let asideLen = stored.path.parentDir.parentDir.len + 1 + suffix
+    checkpoint "renamed-aside directory: " & $asideLen & " characters"
+    require asideLen in 195 ..< 230
+    require asideLen + 1 + stored.path.extractFilename.len >= 260
+    ageTree(stored.path.parentDir, 1000)
+    let run = runCliProcess(["prune", "--keep", "0"], storeEnv(root), cwd = dir)
+    checkpoint run.errors
+    check run.exitCode == 0
+    check run.output.strip() == "v1/git-tree-sha256/" & digest
+    check contentDirs(root).len == 0
+    check dotNames(root).len == 0
