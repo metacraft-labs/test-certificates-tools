@@ -26,7 +26,9 @@ static int tcert_acl_free(int fd) {
 #include <sys/acl.h>
 static int tcert_acl_free(int fd) {
   acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
-  if (!acl) return -1;
+  /* Darwin reports a file with no extended ACL as NULL with ENOENT, not as an
+     empty ACL (acl_get_file(3), ERRORS). */
+  if (!acl) return errno == ENOENT ? 1 : -1;
   acl_entry_t entry;
   /* Darwin returns 0 for an entry and -1/EINVAL for an empty valid ACL.
      https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/acl_get_entry.3.html */
