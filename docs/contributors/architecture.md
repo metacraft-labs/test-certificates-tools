@@ -87,6 +87,11 @@ temporary suffix), and under a root that is not unusually deep it passes
 MAX_PATH (260), where the plain Win32 calls fail. The writer, the reader and
 the pruner pass such paths through `layout.extendedPath`, which gives an
 absolute path of 240 characters or more the `\\?\` extended-length prefix.
+Directories are a stricter case: `CreateDirectoryW` refuses a plain path
+past 248 characters, and `std/os.createDir` does not understand the prefix,
+so the writer creates the root and the content directory with
+`layout.createDirTree`, which creates each missing component in the
+extended-length form.
 
 **Store permission boundaries.** POSIX writers and pruners compare the
 opened root's owner with their effective uid. System operations additionally
