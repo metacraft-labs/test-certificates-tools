@@ -306,7 +306,10 @@ and cannot get them fails, and says so. `notes push` runs the repository's
 turns that off through the library, `PushOptions.runHooks`, so it does not
 re-enter the hook). When that hook is `hook pre-push`, it sees only the notes
 ref and does nothing. `PushOptions.timeoutMs` bounds a push's network time
-from the library; the command sets no limit.
+from the library; the command sets no limit. A program that embeds the library
+and resolved a git of its own passes it as `PushOptions.gitExe` (and
+`fetchNotes(gitExe = …)`), so the push runs that git rather than the first
+`git` on `PATH`; the command uses `PATH`.
 
 `publish`, `push` and `fetch` make commits on the notes ref. They are made
 with git's configured identity. Where git has none — a CI container, say —

@@ -18,6 +18,8 @@
 ##   stderr that must not read as a framing fault, a SHA-256 repository, the
 ##   ``testCertificates.notesRef`` setting, a notes tree with fanout, and the
 ##   union merge of note blobs on its own.
+## * notes push and fetch run the git their caller names (``PushOptions.gitExe``,
+##   ``fetchNotes(gitExe = …)``), not whatever ``git`` is first on ``PATH``.
 ## * work refs a crashed run left behind are removed, live ones kept — refs
 ##   named for an old run, a process that is gone, one still running, another
 ##   host, this process and a name the tool does not make.
@@ -737,6 +739,72 @@ suite "notes":
     check pushed.outcome == soPushed
     check gitIn(remote, ["rev-parse", Ref]).strip() ==
       gitIn(a.dir, ["rev-parse", Ref]).strip()
+
+  test "notes push and fetch run the git their caller names":
+    # A program that embeds the library and resolved its own git (a build
+    # tool that pins one) must not have the library run whatever `git` is
+    # first on PATH. Proven both ways: a git that does not exist makes the
+    # push fail naming it (so the option is not ignored), and on POSIX a
+    # logging wrapper around the real git sees every command the push and
+    # the fetch run. The wrapper is a shell script, which Windows cannot run
+    # as an executable; there the failing half alone shows the option is
+    # honoured.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    let a = newClone(scratch, remote, "a")
+    writeFile(a.dir / "f", "x\n")
+    commitAll(a.dir)
+    putIn(a, certificateText("git-tree-sha1:" & treeOf(a.dir, "HEAD")))
+    check tc(a, ["notes", "publish", "HEAD"]).exitCode == 0
+    var saved: seq[(string, string, bool)]
+    for (k, v) in a.env:
+      saved.add (k, getEnv(k), existsEnv(k))
+      putEnv(k, v)
+    defer:
+      for (k, v, existed) in saved:
+        if existed:
+          putEnv(k, v)
+        else:
+          delEnv(k)
+    var missing = defaultPushOptions()
+    missing.gitExe = scratch / "no-such-git"
+    let refused = pushNotes(a.dir, "origin", options = missing)
+    check not refused.ok
+    checkpoint refused.problems.join("\n")
+    check refused.problems.anyIt("no-such-git" in it)
+    check git(remote, ["rev-parse", "--verify", "--quiet", Ref]).ok == false
+    let missingFetch = fetchNotes(a.dir, "origin", gitExe = scratch / "no-such-git")
+    check not missingFetch.ok
+    when not defined(windows):
+      let realGit = findExe("git")
+      if realGit.len == 0:
+        fatal "git is not on PATH"
+      let log = scratch / "git-calls.log"
+      let wrapper = scratch / "logging-git"
+      writeFile(
+        wrapper,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " & quoteShell(log) & "\nexec " &
+          quoteShell(realGit) & " \"$@\"\n",
+      )
+      setFilePermissions(wrapper, {fpUserRead, fpUserWrite, fpUserExec})
+      var named = defaultPushOptions()
+      named.gitExe = wrapper
+      let pushed = pushNotes(a.dir, "origin", options = named)
+      checkpoint pushed.problems.join("\n")
+      check pushed.ok
+      check pushed.outcome == soPushed
+      let pushLog = readFile(log)
+      check pushLog.splitLines().anyIt(it.startsWith("push "))
+      check pushLog.splitLines().anyIt(it.startsWith("rev-parse "))
+      check gitIn(remote, ["rev-parse", Ref]).strip() ==
+        gitIn(a.dir, ["rev-parse", Ref]).strip()
+      removeFile(log)
+      let fetched = fetchNotes(a.dir, "origin", gitExe = wrapper)
+      checkpoint fetched.problems.join("\n")
+      check fetched.ok
+      check readFile(log).splitLines().anyIt(it.startsWith("fetch "))
 
 suite "note blobs":
   let base = certificateText("git-tree-sha1:" & repeat('a', 40), targets = @["t-1"])

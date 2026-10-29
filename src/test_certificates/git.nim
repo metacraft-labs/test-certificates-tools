@@ -18,6 +18,10 @@ when defined(windows):
 else:
   import std/posix
 
+const DefaultGitExe* = "git"
+  ## The git a command runs unless its caller names another: the first
+  ## ``git`` on ``PATH``.
+
 type
   OutputSink* = proc(data: openArray[char]): bool {.closure.}
     ## Receives a process's standard output piece by piece as it arrives
@@ -733,6 +737,7 @@ proc gitRun*(
     env: openArray[(string, string)] = [],
     timeoutMs = 0,
     onStdout: OutputSink = nil,
+    gitExe = DefaultGitExe,
 ): GitRun =
   ## Run ``git <args>`` in ``cwd`` and answer everything it did: its exit
   ## status, stdout and stderr, apart. For the callers that must tell one
@@ -744,6 +749,11 @@ proc gitRun*(
   ## repository's, with the split index and the filesystem monitor off for
   ## the command (both would otherwise make git write outside, or trust state
   ## from outside, the temporary index).
+  ##
+  ## ``gitExe`` is the git to run: a path, or a name looked up on ``PATH``.
+  ## A program embedding this library that has resolved its own git (a build
+  ## tool that pins one) passes it, so the library never runs a different
+  ## git than its caller does. "" means ``DefaultGitExe``.
   var environment = @PathspecEnvironment
   var argv: seq[string]
   if indexFile.len > 0:
@@ -751,7 +761,15 @@ proc gitRun*(
     argv.add ["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"]
   environment.add env
   argv.add args
-  runProcess("git", argv, cwd, environment, input, timeoutMs, onStdout)
+  runProcess(
+    if gitExe.len == 0: DefaultGitExe else: gitExe,
+    argv,
+    cwd,
+    environment,
+    input,
+    timeoutMs,
+    onStdout,
+  )
 
 proc git*(
     cwd: string,
@@ -760,10 +778,11 @@ proc git*(
     input = "",
     env: openArray[(string, string)] = [],
     timeoutMs = 0,
+    gitExe = DefaultGitExe,
 ): GitStep =
   ## Run ``git <args>`` in ``cwd`` (see ``gitRun``): success with its
   ## stdout, or a sentence naming the command, its status and its stderr.
-  let run = gitRun(cwd, args, indexFile, input, env, timeoutMs)
+  let run = gitRun(cwd, args, indexFile, input, env, timeoutMs, gitExe = gitExe)
   let shown = "`git " & args.join(" ") & "`"
   if not run.started:
     return GitStep(failure: "could not run " & shown & ": " & run.failure)

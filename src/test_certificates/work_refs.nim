@@ -141,16 +141,17 @@ proc isStale*(owner: WorkRefOwner, now: Time): bool =
     age > DeadOwnerGraceSeconds and not processExists(owner.pid)
 
 proc cleanStaleWorkRefs*(
-    dir: string, prefixes: openArray[string], now = getTime()
+    dir: string, prefixes: openArray[string], now = getTime(), gitExe = DefaultGitExe
 ): tuple[removed, problems: seq[string]] =
   ## Delete the stale refs under ``prefixes`` (each ending in ``/``) in the
   ## repository at ``dir``, each only if it still holds the object it was
   ## listed with. Answers what was removed and what could not be.
+  ## ``gitExe`` as for ``git.gitRun``.
   if prefixes.len == 0:
     return
   var args = @["for-each-ref", "--format=%(refname)%00%(objectname)"]
   args.add prefixes
-  let listed = git(dir, args)
+  let listed = git(dir, args, gitExe = gitExe)
   if not listed.ok:
     result.problems.add listed.failure
     return
@@ -166,7 +167,7 @@ proc cleanStaleWorkRefs*(
         leaf = name[p.len .. ^1]
     if leaf.len == 0 or not parseWorkRefName(leaf).isStale(now):
       continue
-    let deleted = gitRun(dir, ["update-ref", "-d", name, oid])
+    let deleted = gitRun(dir, ["update-ref", "-d", name, oid], gitExe = gitExe)
     if deleted.started and deleted.exitCode == 0:
       result.removed.add name
     elif deleted.started:

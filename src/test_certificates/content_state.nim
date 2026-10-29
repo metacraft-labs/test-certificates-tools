@@ -94,11 +94,12 @@ proc scopePathProblem*(path: string): string =
   ""
 
 proc repositoryTreeAlgorithm*(
-    repository: string
+    repository: string, gitExe = DefaultGitExe
 ): tuple[ok: bool, algorithm: ContentAlgorithm, problem: string] =
   ## The ``git-tree-*`` algorithm matching the repository's object format,
   ## the one a producer SHOULD use (Content-Id §4).
-  let format = git(repository, ["rev-parse", "--show-object-format"])
+  ## ``gitExe`` as for ``git.gitRun``.
+  let format = git(repository, ["rev-parse", "--show-object-format"], gitExe = gitExe)
   if not format.ok:
     return (false, caGitTreeSha1, format.failure)
   case singleLine(format.stdout)

@@ -73,6 +73,9 @@ type
     notesRef*: string
     identityEnv*: seq[(string, string)]
       ## The fallback committer identity, when the user has none.
+    gitExe*: string
+      ## The git every notes-ref command for this repository runs
+      ## (``git.gitRun``; ``openNotesRepo``).
     problem*: string
 
   NoteEntry = object
@@ -160,21 +163,30 @@ type
       ## budget runs out is stopped (POSIX; see ``git.runProcess``) and the
       ## push reported as failed. A ``pre-push`` hook sets one so that a
       ## remote that does not answer cannot hold the user's push hostage.
+    gitExe*: string
+      ## The git to run (``git.gitRun``): a program that resolved its own
+      ## passes it, so the push does not run a different git than the program
+      ## does. "" is ``DefaultGitExe``.
 
 proc defaultPushOptions*(): PushOptions =
   ## Five attempts, a 100 ms backoff base, hooks run. Measured on one
   ## x86_64-linux host against a local bare remote: eight clones pushing at
   ## once all land within five attempts; twelve sometimes do not.
-  PushOptions(attempts: DefaultAttempts, baseDelayMs: 100, runHooks: true)
+  PushOptions(
+    attempts: DefaultAttempts, baseDelayMs: 100, runHooks: true, gitExe: DefaultGitExe
+  )
 
 # ---------------------------------------------------------------------------
 # The repository and its notes ref
 # ---------------------------------------------------------------------------
 
-proc validNotesRef*(dir, name: string): tuple[ok: bool, problem: string] =
+proc validNotesRef*(
+    dir, name: string, gitExe = DefaultGitExe
+): tuple[ok: bool, problem: string] =
   ## A notes ref this tool will use: a well-formed ref name under
   ## ``refs/notes/`` (``git notes --ref`` would silently prefix anything
   ## else) and not inside the work namespace.
+  ## ``gitExe`` as for ``git.gitRun``.
   if not name.startsWith("refs/notes/") or name.len <= "refs/notes/".len:
     return (false, "notes ref `" & name & "` is not under refs/notes/")
   if name.startsWith(WorkRefPrefix) or name & "/" == WorkRefPrefix:
@@ -183,20 +195,22 @@ proc validNotesRef*(dir, name: string): tuple[ok: bool, problem: string] =
       "notes ref `" & name & "` is inside " & WorkRefPrefix &
         ", which this tool uses for its own work",
     )
-  let check = git(dir, ["check-ref-format", name])
+  let check = git(dir, ["check-ref-format", name], gitExe = gitExe)
   if not check.ok:
     return (false, "notes ref `" & name & "` is not a valid ref name")
   (true, "")
 
-proc openNotesRepo*(dir: string, notesRef = ""): NotesRepo =
+proc openNotesRepo*(dir: string, notesRef = "", gitExe = DefaultGitExe): NotesRepo =
   ## The repository containing ``dir`` and its notes ref: ``notesRef`` when
   ## given, else ``testCertificates.notesRef``, else the default.
+  ## Every git command for it runs ``gitExe`` (``git.gitRun``).
   result.dir = dir
-  let gitDir = git(dir, ["rev-parse", "--git-dir"])
+  result.gitExe = if gitExe.len == 0: DefaultGitExe else: gitExe
+  let gitDir = git(dir, ["rev-parse", "--git-dir"], gitExe = result.gitExe)
   if not gitDir.ok:
     result.problem = "`" & dir & "` is not inside a git repository: " & gitDir.failure
     return
-  let format = repositoryTreeAlgorithm(dir)
+  let format = repositoryTreeAlgorithm(dir, result.gitExe)
   if not format.ok:
     result.problem = format.problem
     return
@@ -204,7 +218,8 @@ proc openNotesRepo*(dir: string, notesRef = ""): NotesRepo =
   result.hexLen = DigestLength[format.algorithm]
   var name = notesRef
   if name.len == 0:
-    let configured = gitRun(dir, ["config", "--get", NotesRefConfigKey])
+    let configured =
+      gitRun(dir, ["config", "--get", NotesRefConfigKey], gitExe = result.gitExe)
     if not configured.started:
       result.problem = configured.failure
       return
@@ -217,7 +232,7 @@ proc openNotesRepo*(dir: string, notesRef = ""): NotesRepo =
       result.problem =
         "could not read " & NotesRefConfigKey & ": " & configured.stderr.strip()
       return
-  let valid = validNotesRef(dir, name)
+  let valid = validNotesRef(dir, name, result.gitExe)
   if not valid.ok:
     result.problem =
       valid.problem & (
@@ -227,8 +242,8 @@ proc openNotesRepo*(dir: string, notesRef = ""): NotesRepo =
       )
     return
   result.notesRef = name
-  let ident = gitRun(dir, ["var", "GIT_COMMITTER_IDENT"])
-  let authorIdent = gitRun(dir, ["var", "GIT_AUTHOR_IDENT"])
+  let ident = gitRun(dir, ["var", "GIT_COMMITTER_IDENT"], gitExe = result.gitExe)
+  let authorIdent = gitRun(dir, ["var", "GIT_AUTHOR_IDENT"], gitExe = result.gitExe)
   if not ident.started or ident.exitCode != 0 or authorIdent.exitCode != 0:
     result.identityEnv = @[
       ("GIT_AUTHOR_NAME", FallbackName),
@@ -243,6 +258,28 @@ proc fallbackIdentityRemark*(): string =
   "git has no committer identity configured here; the notes commit was made as " &
     FallbackName & " <" & FallbackEmail & ">"
 
+proc gitRun(
+    r: NotesRepo,
+    args: openArray[string],
+    input = "",
+    env: openArray[(string, string)] = [],
+    timeoutMs = 0,
+): GitRun =
+  ## ``git.gitRun`` in the repository, with its git.
+  gitRun(
+    r.dir, args, input = input, env = env, timeoutMs = timeoutMs, gitExe = r.gitExe
+  )
+
+proc git(
+    r: NotesRepo,
+    args: openArray[string],
+    input = "",
+    env: openArray[(string, string)] = [],
+    timeoutMs = 0,
+): GitStep =
+  ## ``git.git`` in the repository, with its git.
+  git(r.dir, args, input = input, env = env, timeoutMs = timeoutMs, gitExe = r.gitExe)
+
 proc isOid(r: NotesRepo, s: string): bool =
   s.len == r.hexLen and s.allCharsInSet({'0' .. '9', 'a' .. 'f'})
 
@@ -253,11 +290,11 @@ proc collectStaleWorkRefs(r: NotesRepo) =
   ## Remove the work and fetch refs crashed runs left behind (``work_refs``).
   ## Opportunistic: what cannot be removed now is tried again next time, and
   ## nothing here is a reason for the operation to fail.
-  discard cleanStaleWorkRefs(r.dir, [WorkRefPrefix, FetchRefPrefix])
+  discard cleanStaleWorkRefs(r.dir, [WorkRefPrefix, FetchRefPrefix], gitExe = r.gitExe)
 
 proc refValue(r: NotesRepo, name: string): tuple[ok: bool, oid, problem: string] =
   ## The commit ``name`` points at; "" when the ref does not exist.
-  let run = gitRun(r.dir, ["rev-parse", "--verify", "--quiet", name & "^{commit}"])
+  let run = gitRun(r, ["rev-parse", "--verify", "--quiet", name & "^{commit}"])
   if not run.started:
     return (false, "", run.failure)
   if run.exitCode == 0:
@@ -267,7 +304,7 @@ proc refValue(r: NotesRepo, name: string): tuple[ok: bool, oid, problem: string]
     return (false, "", "git answered `" & oid & "` for " & name)
   # `rev-parse --verify --quiet` exits 1 and prints nothing for a missing
   # ref. A ref that exists but does not name a commit is not "absent".
-  let exists = gitRun(r.dir, ["show-ref", "--verify", "--quiet", name])
+  let exists = gitRun(r, ["show-ref", "--verify", "--quiet", name])
   if exists.started and exists.exitCode != 0 and run.stderr.strip().len == 0:
     return (true, "", "")
   (false, "", "`" & name & "` cannot be read as a commit: " & run.stderr.strip())
@@ -280,7 +317,7 @@ proc readNotesTree(
   ## write starting from ``commit`` keeps them, since git does.
   if commit.len == 0:
     return (true, initTable[string, NoteEntry](), "")
-  let listing = git(r.dir, ["ls-tree", "-r", "-z", "--full-tree", commit])
+  let listing = git(r, ["ls-tree", "-r", "-z", "--full-tree", commit])
   if not listing.ok:
     return (
       false,
@@ -303,13 +340,13 @@ proc readNotesTree(
 
 proc readBlob(r: NotesRepo, blob: string): tuple[ok: bool, bytes, problem: string] =
   ## A blob's exact bytes: git's stdout alone.
-  let read = git(r.dir, ["cat-file", "blob", blob])
+  let read = git(r, ["cat-file", "blob", blob])
   if not read.ok:
     return (false, "", "cannot read note blob " & blob & ": " & read.failure)
   (true, read.stdout, "")
 
 proc writeBlob(r: NotesRepo, bytes: string): tuple[ok: bool, oid, problem: string] =
-  let written = git(r.dir, ["hash-object", "-w", "--stdin"], input = bytes)
+  let written = git(r, ["hash-object", "-w", "--stdin"], input = bytes)
   if not written.ok:
     return (false, "", written.failure)
   let oid = singleLine(written.stdout)
@@ -332,12 +369,12 @@ proc buildNotesCommit(
   var tree = ""
   try:
     if base.len > 0:
-      let start = git(r.dir, ["update-ref", work, base, r.zeroOid])
+      let start = git(r, ["update-ref", work, base, r.zeroOid])
       if not start.ok:
         return (false, "", start.failure)
     for (annotated, blob) in changes:
       let added = git(
-        r.dir,
+        r,
         ["notes", "--ref", work, "add", "-f", "-C", blob, annotated],
         env = r.identityEnv,
       )
@@ -346,7 +383,7 @@ proc buildNotesCommit(
     let source = if changes.len > 0: work else: base
     if source.len == 0:
       return (false, "", "nothing to commit: no base and no changes")
-    let resolved = git(r.dir, ["rev-parse", "--verify", source & "^{tree}"])
+    let resolved = git(r, ["rev-parse", "--verify", source & "^{tree}"])
     if not resolved.ok:
       return (false, "", resolved.failure)
     tree = singleLine(resolved.stdout)
@@ -356,7 +393,7 @@ proc buildNotesCommit(
       # nothing. Make sure the tree built is ``base`` plus every change.
       if base.len > 0:
         let descends =
-          gitRun(r.dir, ["merge-base", "--is-ancestor", base, work & "^{commit}"])
+          gitRun(r, ["merge-base", "--is-ancestor", base, work & "^{commit}"])
         if not descends.started or descends.exitCode != 0:
           return (false, "", "the work ref " & work & " lost its base while in use")
       let built = readNotesTree(r, work)
@@ -370,12 +407,12 @@ proc buildNotesCommit(
             "the work ref " & work & " lost the note on " & annotated & " while in use",
           )
   finally:
-    discard git(r.dir, ["update-ref", "-d", work])
+    discard git(r, ["update-ref", "-d", work])
   var args = @["commit-tree", tree]
   for p in parents:
     args.add ["-p", p]
   args.add ["-m", message]
-  let made = git(r.dir, args, env = r.identityEnv)
+  let made = git(r, args, env = r.identityEnv)
   if not made.ok:
     return (false, "", made.failure)
   let commit = singleLine(made.stdout)
@@ -390,7 +427,7 @@ proc swapRef(
   ## ("" meaning it must not exist). ``swapped`` false with no problem means
   ## another writer moved it first.
   let expected = if oldValue.len == 0: r.zeroOid else: oldValue
-  let run = gitRun(r.dir, ["update-ref", "-m", message, r.notesRef, newValue, expected])
+  let run = gitRun(r, ["update-ref", "-m", message, r.notesRef, newValue, expected])
   if not run.started:
     return (false, run.failure)
   if run.exitCode == 0:
@@ -403,7 +440,7 @@ proc swapRef(
 proc isAncestor(
     r: NotesRepo, ancestor, descendant: string
 ): tuple[ok, answer: bool, problem: string] =
-  let run = gitRun(r.dir, ["merge-base", "--is-ancestor", ancestor, descendant])
+  let run = gitRun(r, ["merge-base", "--is-ancestor", ancestor, descendant])
   if not run.started:
     return (false, false, run.failure)
   case run.exitCode
@@ -450,7 +487,7 @@ proc resolveCommits*(
   (true, commits, "")
 
 proc treeOf(r: NotesRepo, commit: string): tuple[ok: bool, tree, problem: string] =
-  let resolved = git(r.dir, ["rev-parse", "--verify", "--quiet", commit & "^{tree}"])
+  let resolved = git(r, ["rev-parse", "--verify", "--quiet", commit & "^{tree}"])
   let tree = singleLine(resolved.stdout)
   if not resolved.ok or not r.isOid(tree):
     return (false, "", "the tree of " & commit & " cannot be resolved")
@@ -740,7 +777,7 @@ proc fetchRemoteRef(
   let temporary = workRefName(FetchRefPrefix)
   try:
     let fetched = gitRun(
-      r.dir,
+      r,
       [
         "fetch",
         "--quiet",
@@ -760,7 +797,7 @@ proc fetchRemoteRef(
       # Tell "the remote has no such ref" from every other failure by asking
       # for exactly that ref: `ls-remote --exit-code` answers 2 for no match.
       let listed = gitRun(
-        r.dir,
+        r,
         ["ls-remote", "--exit-code", "--refs", "--end-of-options", remote, r.notesRef],
         timeoutMs = deadline.remainingMs,
       )
@@ -783,7 +820,7 @@ proc fetchRemoteRef(
       )
     (true, true, value.oid, "")
   finally:
-    discard gitRun(r.dir, ["update-ref", "-d", temporary])
+    discard gitRun(r, ["update-ref", "-d", temporary])
 
 proc mergeNotesCommits(
     r: NotesRepo, local, remote: string
@@ -892,10 +929,13 @@ proc integrate(
   report.problems.add r.notesRef & " kept moving under concurrent local writers"
   false
 
-proc fetchNotes*(dir, remote: string, notesRef = ""): SyncReport =
+proc fetchNotes*(
+    dir, remote: string, notesRef = "", gitExe = DefaultGitExe
+): SyncReport =
   ## Tooling §3 ``notes fetch``: the remote's notes ref, merged into the
   ## local one as a union (never one side's).
-  let r = openNotesRepo(dir, notesRef)
+  ## ``gitExe`` as for ``git.gitRun``.
+  let r = openNotesRepo(dir, notesRef, gitExe)
   if not r.ok:
     result.problems.add r.problem
     return
@@ -944,10 +984,7 @@ proc pushOnce(
     args.add "--no-verify"
   args.add ["--end-of-options", remote, commit & ":" & r.notesRef]
   let run = gitRun(
-    r.dir,
-    args,
-    env = [("LC_ALL", "C"), ("LANGUAGE", "")],
-    timeoutMs = deadline.remainingMs,
+    r, args, env = [("LC_ALL", "C"), ("LANGUAGE", "")], timeoutMs = deadline.remainingMs
   )
   if not run.started:
     return (pvFailed, run.failure)
@@ -980,7 +1017,7 @@ proc remoteRefValue(
   ## The remote's notes ref as the remote has it now, by ``git ls-remote``
   ## (which fetches nothing). ``present`` false: the remote has none.
   let listed = gitRun(
-    r.dir,
+    r,
     ["ls-remote", "--refs", "--end-of-options", remote, r.notesRef],
     timeoutMs = deadline.remainingMs,
   )
@@ -1024,7 +1061,7 @@ proc classifyRejection(
     return (rjUnexplained, "", "")
   if now.oid == pushed:
     return (rjAlreadyThere, now.oid, "")
-  let have = gitRun(r.dir, ["cat-file", "-e", now.oid & "^{commit}"])
+  let have = gitRun(r, ["cat-file", "-e", now.oid & "^{commit}"])
   if not have.started:
     return (rjUnknown, now.oid, have.failure)
   if have.exitCode != 0:
@@ -1051,7 +1088,7 @@ proc pushNotes*(
   ## server in another locale or with its own wording is handled alike. A
   ## refusal while the remote ref has not moved past what was pushed is tried
   ## once more and then reported as a failure.
-  let r = openNotesRepo(dir, notesRef)
+  let r = openNotesRepo(dir, notesRef, options.gitExe)
   if not r.ok:
     result.problems.add r.problem
     return
