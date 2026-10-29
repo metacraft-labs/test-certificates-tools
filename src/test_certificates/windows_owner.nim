@@ -93,16 +93,27 @@ when defined(windows):
         return "could not inspect process account: " & osErrorMsg(osLastError())
     defer:
       discard closeHandle(token)
-    var needed: DWORD
-    discard ownerGetTokenInformation(token, 1, nil, 0, addr needed)
-    if needed == 0:
-      return "could not determine effective account SID: " & osErrorMsg(osLastError())
-    let buffer = alloc(needed.int)
-    defer:
-      dealloc(buffer)
-    if ownerGetTokenInformation(token, 1, buffer, needed, addr needed) == 0:
-      return "could not read effective account SID: " & osErrorMsg(osLastError())
-    let user = cast[ptr TokenUserInfo](buffer)
-    if ownerEqualSid(sid, user.user.sid) == 0:
-      return "user root '" & root & "' is owned by another account"
-    ""
+    # The owner a directory this token creates gets: its user SID, or, for a
+    # member of Administrators running elevated, the token's default owner
+    # (TokenOwner), which Windows sets to BUILTIN\Administrators by default.
+    # Both are this account's own; a root owned by any other SID is not.
+    # https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-token_owner
+    for (infoClass, what) in [(DWORD(1), "account"), (DWORD(4), "default owner")]:
+      var needed: DWORD
+      discard ownerGetTokenInformation(token, infoClass, nil, 0, addr needed)
+      if needed == 0:
+        return
+          "could not determine the effective " & what & " SID: " &
+          osErrorMsg(osLastError())
+      let buffer = alloc(needed.int)
+      defer:
+        dealloc(buffer)
+      if ownerGetTokenInformation(token, infoClass, buffer, needed, addr needed) == 0:
+        return
+          "could not read the effective " & what & " SID: " & osErrorMsg(osLastError())
+      # TOKEN_USER starts with a SID_AND_ATTRIBUTES, TOKEN_OWNER with a PSID:
+      # either way the first field is the SID pointer.
+      let candidate = cast[ptr pointer](buffer)[]
+      if candidate != nil and ownerEqualSid(sid, candidate) != 0:
+        return ""
+    "user root '" & root & "' is owned by another account"

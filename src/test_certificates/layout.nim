@@ -55,3 +55,30 @@ proc removalName*(digest: string): string =
 
 proc isTemporaryName*(name: string): bool =
   name.startsWith(".") and TemporaryMarker in name
+
+const LongPathThreshold = 240
+  ## Below MAX_PATH (260) with room for what Windows appends internally.
+
+proc extendedPath*(path: string): string =
+  ## ``path`` in a form every file API accepts at any length. On Windows a
+  ## record's path is long by construction (``<root>\v1\<algorithm>\`` with a
+  ## 64-digit digest, then a 64-digit payload hash and, while it is written,
+  ## a temporary suffix) and can pass MAX_PATH (260 characters) under a root
+  ## that is not even unusually deep, where the plain Win32 calls fail. An
+  ## absolute drive path that long gets the extended-length prefix ``\\?\``
+  ## (with ``/`` turned into ``\`` and ``.`` and ``..`` resolved, since that
+  ## form passes the path to the file system as it is); a UNC path gets
+  ## ``\\?\UNC\``. Anything else, and every path on POSIX, is returned
+  ## unchanged.
+  ## https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
+  when defined(windows):
+    if path.len < LongPathThreshold or path.startsWith(r"\\?\"):
+      return path
+    let native = path.replace('/', '\\')
+    if native.len >= 3 and native[1] == ':' and native[2] == '\\':
+      return r"\\?\" & normalizedPath(native)
+    if native.startsWith(r"\\") and not native.startsWith(r"\\.\"):
+      return r"\\?\UNC\" & normalizedPath(native[2 .. ^1])
+    path
+  else:
+    path

@@ -165,7 +165,7 @@ proc findById*(roots: StoreRoots, contentId: string): FindReport =
     for path in files:
       var bytes: string
       try:
-        bytes = readFile(path)
+        bytes = readFile(extendedPath(path))
       except CatchableError as err:
         result.problems.add "'" & path & "' could not be read: " & err.msg
         continue

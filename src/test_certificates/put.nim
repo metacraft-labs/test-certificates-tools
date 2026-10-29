@@ -453,9 +453,9 @@ else:
         result.problem = "could not create '" & dir & "': " & err.msg
         return
       var keep = false
-      if fileExists(result.path):
+      if fileExists(extendedPath(result.path)):
         try:
-          let parsed = parseCertificate(readFile(result.path))
+          let parsed = parseCertificate(readFile(extendedPath(result.path)))
           if not parsed.ok:
             result.problem = "the existing certificate is malformed: " & parsed.problem
             return
@@ -478,7 +478,7 @@ else:
       let temporary = dir / temporaryName(result.path.extractFilename)
       try:
         var f: File
-        if not open(f, temporary, fmWrite):
+        if not open(f, extendedPath(temporary), fmWrite):
           raise newException(IOError, "cannot open '" & temporary & "'")
         try:
           f.write(bytes)
@@ -489,12 +489,12 @@ else:
           hook(attempt)
         # MoveFileExW with MOVEFILE_REPLACE_EXISTING: an atomic replace
         # within one volume.
-        moveFile(temporary, result.path)
+        moveFile(extendedPath(temporary), extendedPath(result.path))
         result.ok = true
         return
       except CatchableError as err:
         try:
-          removeFile(temporary)
+          removeFile(extendedPath(temporary))
         except CatchableError:
           discard
         if attempt == 0 and not dirExists(dir):

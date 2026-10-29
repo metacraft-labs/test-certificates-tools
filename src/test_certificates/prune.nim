@@ -325,7 +325,7 @@ proc pruneRoot*(
                 else:
                   removeDir(digestPath)
               else:
-                removeDir(digestPath)
+                removeDir(extendedPath(digestPath))
               result.leftovers.add root / LayoutVersion / algorithmPath.extractFilename /
                 name
             except OSError as err:
@@ -405,7 +405,7 @@ proc pruneRoot*(
         else:
           removeDir(aside)
       else:
-        removeDir(aside)
+        removeDir(extendedPath(aside))
     except OSError as err:
       result.errors.add "'" & aside &
         "' could not be removed (a later prune deletes it): " & err.msg
