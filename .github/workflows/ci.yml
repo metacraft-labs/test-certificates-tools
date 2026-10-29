@@ -36,6 +36,16 @@ jobs:
       preferred: macos-26
       fallback: '["self-hosted","macos","arm64"]'
 
+  choose-linux-arm64:
+    # GitHub's free hosted ARM runner for this public repository. The
+    # self-hosted `[self-hosted, linux, arm64]` pool is the fallback; it is
+    # disabled in the central GARM today (infra central-garm.nix, 2026-10-09),
+    # so without a hosted preference this leg queued with no runner at all.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04-arm
+      fallback: '["self-hosted","linux","arm64"]'
+
   lint:
     needs: choose-linux
     name: Lint
@@ -80,9 +90,9 @@ jobs:
           secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
 
   test:
-    needs: [choose-linux, choose-macos]
+    needs: [choose-linux, choose-macos, choose-linux-arm64]
     name: Test (${{ matrix.slug }})
-    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.slug == 'linux-arm64' && fromJSON(needs.choose-linux-arm64.outputs.runs_on) || matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
