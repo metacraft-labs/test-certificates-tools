@@ -1,0 +1,15 @@
+test-certificates-tools
+Copyright (c) Metacraft Labs
+
+Licensed under the Apache License, Version 2.0. A copy of the license is in the
+LICENSE file at the root of this repository.
+
+--------------------------------------------------------------------------------
+Third-party code redistributed in this repository
+--------------------------------------------------------------------------------
+
+None. Every tracked file is original work of Metacraft Labs. The package
+depends on nothing beyond the Nim standard library. The test suite reads the
+conformance vectors of the test-certificate specification
+(https://github.com/metacraft-labs/test-certificates-spec) from a separate
+checkout at test time; none of them are copied into this repository.

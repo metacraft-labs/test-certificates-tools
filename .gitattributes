@@ -1,0 +1,4 @@
+# Certificates and canonical payloads are byte-exact: a CRLF introduced by a
+# checkout changes what a test feeds the store. The test fixtures are written
+# by the tests themselves, but keep every text file LF on every platform.
+* text=auto eol=lf
