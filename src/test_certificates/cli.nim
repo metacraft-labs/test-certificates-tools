@@ -558,16 +558,16 @@ proc prePushCommand(io: CliIo, args: seq[string]): int =
       appended += t.appended.len
       replaced += t.replaced.len
     var line =
-      $report.certified.len & " certified tree(s) among " & $report.introduced.len &
+      $report.certified.len & " certified tree(s) among " & $report.introducedCount &
       " pushed commit(s): " & $appended & " certificate(s) added to " & report.notesRef
     if replaced > 0:
       line.add ", " & $replaced & " replaced by a signed copy"
     if report.pushRan and report.pushed.ok:
       line.add "; " & $report.pushed.outcome & " to " & report.target
     hookSay io, line
-  elif report.introduced.len > 0 and report.problems.len == 0:
+  elif report.introducedCount > 0 and report.problems.len == 0:
     hookSay io,
-      "no stored certificates for the " & $report.introduced.len &
+      "no stored certificates for the " & $report.introducedCount &
         " commit(s) this push introduces; nothing to propagate"
   if report.problems.len > 0:
     for p in report.problems:

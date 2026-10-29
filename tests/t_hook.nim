@@ -16,6 +16,10 @@
 ##   refs whose remote objects bound each other's introduced commits, a
 ##   budget that would be unlimited, the opt-out variable, and ``hook
 ##   install`` never replacing a hook. Declared scopes: ``t_scopes``.
+## * a_push_to_a_url_streams_a_long_history_in_bounded_memory — 50 000
+##   commits made by ``git fast-import``; in-process, so the allocator's
+##   high-water mark can be read. Batched scoped trees choose what one batch
+##   chooses.
 ##
 ## Most hooks here are a two-line script that counts its invocations and
 ## then execs the built binary by absolute path, so the count observes
@@ -310,28 +314,32 @@ suite "hook pre-push":
 
     # A remote that never answers: stopped within the time budget. The hook
     # runs with its standard streams on pipes, as a dispatcher that captures
-    # its output runs it. The remote helper (`sleep`) outlives the git
-    # process the hook stops; it must hold none of those pipes, or reading
-    # them to the end would wait the full 20 s for it.
-    when not defined(windows):
-      let hang = "ext::sleep 20"
-      let started = getMonoTime()
-      let hung = hookDirect(
-        a,
-        line,
-        [hang, hang],
-        [
-          ("TEST_CERTIFICATES_HOOK_TIMEOUT", "2"),
-          ("GIT_CONFIG_COUNT", "1"),
-          ("GIT_CONFIG_KEY_0", "protocol.ext.allow"),
-          ("GIT_CONFIG_VALUE_0", "always"),
-        ],
-      )
-      let took = (getMonoTime() - started).inMilliseconds
-      checkpoint hung.errors
-      check hung.exitCode == 0
-      check took < 10_000
-      check "did not finish within" in hung.errors or "time budget" in hung.errors
+    # its output runs it. The remote helper (`sleep`) is stopped together
+    # with the git that started it (its process group; on Windows its job),
+    # and must hold none of the hook's pipes meanwhile, or reading them to
+    # the end would wait the full 20 s for it. On Windows `sleep` is
+    # Git for Windows' own (usr\bin, which scripts/windows/test.ps1 puts on
+    # PATH), and the stop is the job object's.
+    if findExe("sleep").len == 0:
+      fatal "`sleep` is not on PATH (on Windows: Git for Windows' usr\\bin)"
+    let hang = "ext::sleep 20"
+    let started = getMonoTime()
+    let hung = hookDirect(
+      a,
+      line,
+      [hang, hang],
+      [
+        ("TEST_CERTIFICATES_HOOK_TIMEOUT", "2"),
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "protocol.ext.allow"),
+        ("GIT_CONFIG_VALUE_0", "always"),
+      ],
+    )
+    let took = (getMonoTime() - started).inMilliseconds
+    checkpoint hung.errors
+    check hung.exitCode == 0
+    check took < 10_000
+    check "did not finish within" in hung.errors or "time budget" in hung.errors
 
     # An unreadable store.
     when not defined(windows):
@@ -497,3 +505,114 @@ suite "pre-push input":
     check parsed.refs[0].remoteOid == zeros()
     check parsed.refs[1].localOid == repeat('b', 64)
     check parsed.faults.len == 2
+
+proc importHistory(dir: string, count: int, scoped: bool) =
+  ## ``count`` commits on ``main``, made by ``git fast-import`` in chunks of
+  ## 5 000 so no large input is ever held here. Commit ``i`` (from 1) has
+  ## ``other`` = ``i``, a distinct tree per commit, and with ``scoped`` a file
+  ## ``src/a`` = ``i div 10``, so ten neighbouring commits share their tree in
+  ## the scope ``src``.
+  var i = 1
+  while i <= count:
+    var stream = ""
+    let last = min(count, i + 4999)
+    for n in i .. last:
+      stream.add "commit refs/heads/main\n"
+      stream.add "committer T <t@example.invalid> " & $(1_700_000_000 + n) & " +0000\n"
+      stream.add "data 1\nx\n"
+      if n == i and i > 1:
+        stream.add "from refs/heads/main^0\n"
+      let other = $n & "\n"
+      stream.add "M 100644 inline other\ndata " & $other.len & "\n" & other & "\n"
+      if scoped:
+        let a = $(n div 10) & "\n"
+        stream.add "M 100644 inline src/a\ndata " & $a.len & "\n" & a & "\n"
+    discard gitIn(dir, ["fast-import", "--quiet"], input = stream)
+    i = last + 1
+
+proc hookInProcess(c: Clone, remote, tip: string, batchTrees = 0): HookReport =
+  ## The hook as a library call, for a push of ``main`` to the URL
+  ## ``remote`` that does not have it.
+  var options = defaultHookOptions()
+  options.batchTrees = batchTrees
+  prePushHook(
+    c.dir,
+    "",
+    remote,
+    "refs/heads/main " & tip & " refs/heads/main " & zeros() & "\n",
+    StoreRoots(user: c.store),
+    options,
+  )
+
+suite "hook pre-push, long histories":
+  # A push to a URL with nothing known on the remote considers the pushed
+  # ref's whole history. In-process library calls, so the allocator's
+  # high-water mark (`getMaxMem`) can be read: it must not grow with the
+  # history, as it did when the whole `rev-list` output was held.
+  setup:
+    let gitConfig = getTempDir() / ("t-hook-gitconfig-" & $getCurrentProcessId())
+    writeFile(gitConfig, "")
+    putEnv("GIT_CONFIG_GLOBAL", gitConfig)
+    putEnv("GIT_CONFIG_NOSYSTEM", "1")
+  teardown:
+    delEnv("GIT_CONFIG_GLOBAL")
+    delEnv("GIT_CONFIG_NOSYSTEM")
+    removeFile(gitConfig)
+
+  test "a_push_to_a_url_streams_a_long_history_in_bounded_memory":
+    const Commits = 50_000
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    var a = Clone(dir: scratch / "a", store: scratch / "a-store")
+    createDir(a.dir)
+    discard gitIn(a.dir, ["init", "-q", "-b", "main"])
+    importHistory(a.dir, Commits, scoped = false)
+    let tip = gitIn(a.dir, ["rev-parse", "main"]).strip()
+    let deep = gitIn(a.dir, ["rev-parse", "main~" & $(Commits - 10)]).strip()
+    certify(a, treeOf(a.dir, tip))
+    certify(a, treeOf(a.dir, deep))
+    let before = getMaxMem()
+    let started = getMonoTime()
+    let report = hookInProcess(a, remote, tip)
+    let grew = getMaxMem() - before
+    checkpoint "took " & $(getMonoTime() - started).inMilliseconds & " ms; " &
+      "the allocator's high-water mark grew by " & $grew & " bytes"
+    checkpoint report.problems.join("\n")
+    check report.introducedCount == Commits
+    check report.certified == @[tip, deep]
+    check report.propagated
+    check remoteKeys(remote) == toHashSet([treeOf(a.dir, tip), treeOf(a.dir, deep)])
+    # The listing alone is about 4.5 MB of text (two lines of 41 and 47
+    # bytes a commit); holding it, or a sequence of its commits, would show.
+    check grew < 2 * 1024 * 1024
+
+  test "batched scoped trees choose what one batch chooses":
+    const Commits = 3_000
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    var a = Clone(dir: scratch / "a", store: scratch / "a-store")
+    createDir(a.dir)
+    discard gitIn(a.dir, ["init", "-q", "-b", "main"])
+    discard gitIn(a.dir, ["config", "--add", ScopeSection & ".src.path", "src"])
+    importHistory(a.dir, Commits, scoped = true)
+    let tip = gitIn(a.dir, ["rev-parse", "main"]).strip()
+    proc commit(n: int): string =
+      gitIn(a.dir, ["rev-parse", "main~" & $(Commits - n)]).strip()
+
+    # Commits 500..509 share their scoped tree; the newest of them is the
+    # first rev-list meets. Commit 3's own tree is certified too.
+    let scopedId = computeContentId(a.dir, commitState(commit(505)), ["src"])
+    require scopedId.outcome == coComputed
+    putIn(a, certificateText(scopedId.id))
+    certify(a, treeOf(a.dir, commit(3)))
+    let small = hookInProcess(a, remote, tip, batchTrees = 7)
+    checkpoint small.problems.join("\n")
+    check small.introducedCount == Commits
+    check small.certified == @[commit(509), commit(3)]
+    let whole = hookInProcess(a, remote, tip, batchTrees = Commits + 1)
+    check whole.certified == small.certified
+    check whole.introducedCount == Commits
