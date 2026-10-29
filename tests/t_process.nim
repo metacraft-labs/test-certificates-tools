@@ -22,6 +22,8 @@
 ##
 ## * the ``/bin/sh`` checks of descriptors 3..63, signals and SIGTERM-ignoring
 ##   children;
+## * a descriptor limit at or below the cap is honoured — runs a child under a
+##   lowered RLIMIT_NOFILE soft limit;
 ## * an_interrupt_stops_the_childs_process_group — SIGINT to a process
 ##   running a timed child stops the child's whole group before the signal
 ##   takes effect.
@@ -257,6 +259,29 @@ when not defined(windows):
         getCurrentDir(),
       )
       check control.stdout.strip() == "7"
+
+    test "a descriptor limit at or below the cap is honoured":
+      # The soft RLIMIT_NOFILE decides how many descriptors a child closes one
+      # by one. Hosts set it to anything: 1024 is common, GitHub's Linux
+      # runners use 65536 (the cap itself), this workstation 524288. Every
+      # value at or below the cap once failed a range check before any child
+      # started (`rlim_t` is unsigned in C), so run a child under each kind.
+      var saved: RLimit
+      require getrlimit(RLIMIT_NOFILE, saved) == 0
+      defer:
+        discard setrlimit(RLIMIT_NOFILE, saved)
+      let hard = cast[int64](saved.rlim_max)
+      for wanted in [1024'i64, 65536]:
+        let soft = if hard > 0 and hard < wanted: hard else: wanted
+        var lowered = saved
+        lowered.rlim_cur = int(soft)
+        require setrlimit(RLIMIT_NOFILE, lowered) == 0
+        checkpoint "soft descriptor limit " & $soft
+        let run = runProcess("/bin/sh", ["-c", "echo ok"], getCurrentDir())
+        check run.started
+        check run.exitCode == 0
+        check run.stdout == "ok\n"
+        require setrlimit(RLIMIT_NOFILE, saved) == 0
 
     test "a_detached_grandchild_does_not_hold_the_run_open":
       let marker = getTempDir() / ("t-process-" & $getCurrentProcessId())

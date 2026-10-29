@@ -214,10 +214,17 @@ when not defined(windows):
     ## One above the highest descriptor this process can have open (its
     ## RLIMIT_NOFILE soft limit), capped at ``DescriptorLimitCap``.
     var limit: RLimit
-    if getrlimit(RLIMIT_NOFILE, limit) != 0 or limit.rlim_cur <= 0 or
-        limit.rlim_cur > DescriptorLimitCap:
+    if getrlimit(RLIMIT_NOFILE, limit) != 0:
       return DescriptorLimitCap
-    cint(limit.rlim_cur)
+    # `std/posix` declares the field `int`, but C's `rlim_t` is unsigned. Any
+    # comparison or range check made on the field itself is compiled as an
+    # unsigned C comparison against the bounds, so `cint(65536)` failed its
+    # check and `<= 0` missed RLIM_INFINITY. Copy it into a real signed local
+    # first; RLIM_INFINITY (all ones) then reads as negative, i.e. unlimited.
+    let current = cast[int64](limit.rlim_cur)
+    if current <= 0 or current > DescriptorLimitCap:
+      return DescriptorLimitCap
+    cint(current)
 
   {.push stackTrace: off, profiler: off.}
   proc closeOtherDescriptors(keep, limit: cint) =
