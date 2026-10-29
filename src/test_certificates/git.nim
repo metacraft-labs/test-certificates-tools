@@ -384,11 +384,15 @@ when not defined(windows):
       return (false, 0)
 
 when not defined(windows):
+  template forwardedSignals(): untyped =
+    ## Signals that end this process by default and that a terminal or a
+    ## supervisor sends to stop it. While a child of its own session runs,
+    ## they are held and passed on to that child's group first. A template,
+    ## not a constant: on macOS `std/posix` imports the signal numbers as
+    ## variables, which a constant cannot be built from.
+    [SIGINT, SIGTERM, SIGHUP]
+
   const
-    ForwardedSignals = [SIGINT, SIGTERM, SIGHUP]
-      ## Signals that end this process by default and that a terminal or a
-      ## supervisor sends to stop it. While a child of its own session runs,
-      ## they are held and passed on to that child's group first.
     InterruptPollMs = 100
       ## How often a pending forwarded signal is looked for while the child
       ## runs (``poll`` is not woken by a blocked signal).
@@ -549,7 +553,7 @@ proc runProcess*(
       var none: Sigset
       discard sigemptyset(none)
       discard pthread_sigmask(SIG_BLOCK, none, savedMask)
-      for s in ForwardedSignals:
+      for s in forwardedSignals():
         if sigismember(savedMask, s) != 1:
           discard sigaddset(watched, s)
           watching = true
@@ -584,7 +588,7 @@ proc runProcess*(
           if watching:
             var pending: Sigset
             discard sigpending(pending)
-            for s in ForwardedSignals:
+            for s in forwardedSignals():
               if sigismember(watched, s) == 1 and sigismember(pending, s) == 1:
                 interruptedBy = s
                 break pump

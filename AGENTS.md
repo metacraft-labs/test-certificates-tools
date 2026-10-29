@@ -27,7 +27,7 @@ Inside the dev shell (`nix develop`, or direnv):
 ```sh
 just build     # build/bin/test-certificates
 just test      # builds, then runs every tests/t_*.nim
-just lint      # nph --check, nim check (incl. a Windows cross-check), nixfmt --check
+just lint      # nph --check, nim check (incl. Windows and macOS cross-checks), nixfmt --check
 just format    # nph, nixfmt
 nix build .#default
 nix flake check

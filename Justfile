@@ -46,7 +46,8 @@ test-one name: build
 lint: lint-nim lint-nix
 
 # Formatting is nph's, and every module type-checks with no warnings. The
-# Windows code paths, the tests included, are type-checked by a cross `nim check`.
+# Windows and macOS code paths, the tests included, are type-checked by cross
+# `nim check`s (on macOS `std/posix` differs: signal numbers are variables).
 lint-nim:
     nph --check src tests
     for f in src/test_certificates.nim src/test_certificates_cli.nim tests/t_*.nim tests/process_helper.nim; do \
@@ -54,6 +55,9 @@ lint-nim:
     done
     for f in src/test_certificates.nim src/test_certificates_cli.nim tests/t_*.nim tests/process_helper.nim; do \
       nim check --hints:off --os:windows "$f"; \
+    done
+    for f in src/test_certificates.nim src/test_certificates_cli.nim tests/t_*.nim tests/process_helper.nim; do \
+      nim check --hints:off --os:macosx --cpu:arm64 "$f"; \
     done
 
 lint-nix:
