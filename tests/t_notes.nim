@@ -4,8 +4,12 @@
 ##
 ## * notes_publish_keys_by_tree_and_is_idempotent
 ## * notes_import_round_trips_through_a_fresh_clone
+## * a lost race is told from a refusal by the remote ref — a server that
+##   refuses in words of its own (a ``pre-receive`` hook): a race is merged
+##   and retried, a refusal fails after one more try.
 ## * concurrent_notes_pushes_keep_every_record — several clones' ``notes
-##   push`` PROCESSES race to one bare remote; every record survives.
+##   push`` PROCESSES race to one bare remote; every record survives, and a
+##   clone that gives up says so and lands with its next push.
 ## * a_note_never_drops_an_unrecognised_framework — another framework's
 ##   record, a record of a schema this tool cannot read and foreign leading
 ##   text survive publish and a union merge byte for byte.
@@ -14,6 +18,9 @@
 ##   stderr that must not read as a framing fault, a SHA-256 repository, the
 ##   ``testCertificates.notesRef`` setting, a notes tree with fanout, and the
 ##   union merge of note blobs on its own.
+## * work refs a crashed run left behind are removed, live ones kept — refs
+##   named for an old run, a process that is gone, one still running, another
+##   host, this process and a name the tool does not make.
 ##
 ## Every command runs with a global git configuration of its own that holds
 ## only ``user.useConfigOnly = true`` (``GIT_CONFIG_GLOBAL``,
@@ -309,6 +316,75 @@ suite "notes":
     check "fast-forwarded" in back.errors
     check gitIn(a.dir, ["rev-parse", Ref]).strip() == tip
 
+  test "a lost race is told from a refusal by the remote ref, not the server's text":
+    # A real remote whose `pre-receive` hook stands in for a server whose
+    # wording git does not know: it refuses with text of its own (German, and
+    # in the second case words that LOOK like a lost race), so the server's
+    # reason says nothing usable. Only the remote ref's value can tell the
+    # two cases apart.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    let seed = newClone(scratch, remote, "seed")
+    writeFile(seed.dir / "f", "x\n")
+    commitAll(seed.dir)
+    discard gitIn(seed.dir, ["push", "-q", "origin", "HEAD:refs/heads/main"])
+    let a = newClone(scratch, remote, "a")
+    let b = newClone(scratch, remote, "b")
+    let tree = treeOf(a.dir, "HEAD")
+    let ca = certificateText("git-tree-sha1:" & tree, targets = @["t-a"])
+    let cb = certificateText("git-tree-sha1:" & tree, targets = @["t-b"])
+    putIn(a, ca)
+    putIn(b, cb)
+    check tc(a, ["notes", "publish", "HEAD"]).exitCode == 0
+    check tc(b, ["notes", "publish", "HEAD"]).exitCode == 0
+    # b's notes commit waits on the remote under another name; a never sees it.
+    discard gitIn(b.dir, ["push", "-q", "origin", Ref & ":refs/parked/notes"])
+    let hook = remote / "hooks" / "pre-receive"
+
+    # 1. A lost race: the first time, the hook moves the notes ref to b's
+    # commit itself (as a concurrent push landing first would) and refuses
+    # in its own words. The push must fetch, merge and land on the retry.
+    writeFile(
+      hook,
+      "#!/bin/sh\ncat >/dev/null\nif [ ! -e raced ]; then\n  : > raced\n" &
+        "  unset GIT_QUARANTINE_PATH\n" & "  git update-ref " & Ref &
+        " \"$(git rev-parse refs/parked/notes)\" || exit 3\n" &
+        "  echo 'Abgelehnt: die Referenz ist gesperrt' >&2\n  exit 1\nfi\nexit 0\n",
+    )
+    setFilePermissions(hook, {fpUserRead, fpUserWrite, fpUserExec})
+    let raced = tc(a, ["notes", "push", "origin"])
+    checkpoint raced.errors
+    check raced.exitCode == 0
+    check fileExists(remote / "raced")
+    check "after 2 attempt(s)" in raced.errors
+    check "1 union merge(s)" in raced.errors
+    let note = noteBlob(remote, tree)
+    check note.payloadHashes.toHashSet ==
+      toHashSet([sha256Hex(record(ca)), sha256Hex(record(cb))])
+
+    # 2. A refusal: the hook refuses every time, with words that read like a
+    # lost race, and the remote ref does not move. The push is tried once
+    # more, then fails, saying it was refused; the remote is untouched.
+    let before = gitIn(remote, ["rev-parse", Ref]).strip()
+    putIn(a, certificateText("git-tree-sha1:" & tree, targets = @["t-later"]))
+    check tc(a, ["notes", "publish", "HEAD"]).exitCode == 0
+    writeFile(
+      hook,
+      "#!/bin/sh\ncat >/dev/null\necho refused >> refusals\n" &
+        "echo '! [rejected] (fetch first): cannot lock ref, reference already exists' >&2\n" &
+        "exit 1\n",
+    )
+    setFilePermissions(hook, {fpUserRead, fpUserWrite, fpUserExec})
+    let refused = tc(a, ["notes", "push", "origin"])
+    checkpoint refused.errors
+    check refused.exitCode != 0
+    check "was refused" in refused.errors
+    check "kept moving" notin refused.errors
+    check readFile(remote / "refusals").splitLines().filterIt(it.len > 0).len == 2
+    check gitIn(remote, ["rev-parse", Ref]).strip() == before
+
   test "concurrent_notes_pushes_keep_every_record":
     let scratch = scratchDir()
     defer:
@@ -345,14 +421,27 @@ suite "notes":
     var processes: seq[Process]
     for c in clones:
       processes.add spawnCli(c, @["notes", "push", "origin"])
-    var outputs: seq[string]
-    for p in processes:
+    # The retry bound (``PushOptions.attempts``, five) is a design choice, and
+    # how many rounds six racing pushers need depends on how the host
+    # schedules them: on a loaded host a clone can lose five rounds in a row.
+    # What must hold whatever the scheduling: no record is ever lost, a
+    # clone that gives up SAYS it gave up (and fails nothing else), and its
+    # records still land with a later push. So a clone may give up here, and
+    # is then pushed again on its own; any other failure fails the test.
+    var gaveUp: seq[int]
+    for i, p in processes:
       let output = p.outputStream.readAll()
       let code = p.waitForExit()
       p.close()
-      outputs.add output
-      checkpoint output
-      check code == 0
+      checkpoint "clone " & $i & " (exit " & $code & "):\n" & output
+      if code != 0:
+        check "kept moving; gave up after" in output
+        gaveUp.add i
+    check gaveUp.len < Clones # At least one landed while all raced.
+    for i in gaveUp:
+      let again = tc(clones[i], ["notes", "push", "origin"])
+      checkpoint again.errors
+      check again.exitCode == 0
 
     let note = noteBlob(remote, tree)
     check note.payloadHashes.toHashSet == expected.toHashSet
@@ -766,3 +855,74 @@ suite "note blobs":
     var pieces = splitNote(unterminated)
     check addRecord(pieces, recordPiece(record(second))) == aoAppended
     check renderNote(pieces) == framed(record(base), record(second))
+
+  test "work refs a crashed run left behind are removed, live ones kept":
+    # A run that is killed cannot delete its private work ref; the next
+    # notes operation removes it when its maker is gone or it is old
+    # (`work_refs`). Refs are made with plain git, as the crashed run did.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    let a = newClone(scratch, remote, "a")
+    writeFile(a.dir / "f", "x\n")
+    commitAll(a.dir)
+    let head = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+    proc stamp(secondsAgo: int): string =
+      let t = getTime() - initDuration(seconds = secondsAgo)
+      $t.toUnix() & align($t.nanosecond, 9, '0')
+
+    # A process that has exited (its pid is not reused this quickly), and one
+    # that is still running (`git cat-file --batch` waits on its input).
+    let finished = startProcess("git", args = ["--version"], options = {poUsePath})
+    let deadPid = finished.processID
+    discard finished.waitForExit()
+    finished.close()
+    let running =
+      startProcess("git", args = ["cat-file", "--batch"], options = {poUsePath})
+    defer:
+      running.terminate()
+      discard running.waitForExit()
+      running.close()
+    let livePid = running.processID
+    check not processExists(deadPid)
+    check processExists(livePid)
+    let host = hostTag()
+    let removed = [
+      WorkRefPrefix & "otherhost-123-1-" & stamp(2 * 3600), # Old, any host.
+      WorkRefPrefix & "123-1-" & stamp(2 * 3600), # Old, the name without a host.
+      WorkRefPrefix & host & "-" & $deadPid & "-1-" & stamp(300), # Maker gone.
+      FetchRefPrefix & host & "-" & $deadPid & "-2-" & stamp(300),
+    ]
+    let kept = [
+      WorkRefPrefix & host & "-" & $livePid & "-1-" & stamp(300), # Maker running.
+      WorkRefPrefix & host & "-" & $deadPid & "-3-" & stamp(5), # Too young to judge.
+      WorkRefPrefix & "otherhost-" & $deadPid & "-1-" & stamp(300), # Not this host.
+      WorkRefPrefix & host & "-" & $getCurrentProcessId() & "-1-" & stamp(300),
+      WorkRefPrefix & "not-a-name-this-tool-makes",
+    ]
+    for name in @removed & @kept:
+      discard gitIn(a.dir, ["update-ref", name, head])
+    putIn(a, certificateText("git-tree-sha1:" & treeOf(a.dir, "HEAD")))
+    let published = tc(a, ["notes", "publish", "HEAD"])
+    checkpoint published.errors
+    check published.exitCode == 0
+    let left = gitIn(
+        a.dir, ["for-each-ref", "--format=%(refname)", WorkRefPrefix, FetchRefPrefix]
+      )
+      .splitLines()
+      .filterIt(it.len > 0)
+    for name in removed:
+      checkpoint name
+      check name notin left
+    for name in kept:
+      checkpoint name
+      check name in left
+    # The publish's own work ref is gone too: only the kept ones are left.
+    check left.len == kept.len
+    # The same rule as a library call, at a chosen time.
+    let later = cleanStaleWorkRefs(
+      a.dir, [WorkRefPrefix, FetchRefPrefix], getTime() + initDuration(hours = 2)
+    )
+    check later.problems.len == 0
+    check later.removed.len == kept.len - 1 # All but the unreadable name.

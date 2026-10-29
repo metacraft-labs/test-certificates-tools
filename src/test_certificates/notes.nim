@@ -46,11 +46,11 @@
 ## made as ``test-certificates <test-certificates@localhost>`` rather than
 ## failing.
 
-import std/[algorithm, os, random, sequtils, sets, strutils, tables, times]
-import ./[git, certificate, content_id, content_state, find, put, roots, layout, scopes]
-import ./note_framing
+import std/[algorithm, monotimes, os, random, sequtils, sets, strutils, tables, times]
+import ./[git, certificate, content_id, content_state, find, put, roots, scopes]
+import ./[note_framing, work_refs]
 
-export note_framing
+export note_framing, work_refs
 
 const
   DefaultNotesRef* = "refs/notes/test-certificates/certificates"
@@ -249,6 +249,12 @@ proc isOid(r: NotesRepo, s: string): bool =
 proc zeroOid(r: NotesRepo): string =
   repeat('0', r.hexLen)
 
+proc collectStaleWorkRefs(r: NotesRepo) =
+  ## Remove the work and fetch refs crashed runs left behind (``work_refs``).
+  ## Opportunistic: what cannot be removed now is tried again next time, and
+  ## nothing here is a reason for the operation to fail.
+  discard cleanStaleWorkRefs(r.dir, [WorkRefPrefix, FetchRefPrefix])
+
 proc refValue(r: NotesRepo, name: string): tuple[ok: bool, oid, problem: string] =
   ## The commit ``name`` points at; "" when the ref does not exist.
   let run = gitRun(r.dir, ["rev-parse", "--verify", "--quiet", name & "^{commit}"])
@@ -322,7 +328,7 @@ proc buildNotesCommit(
   ## of ``changes`` attached (replacing what was there), and whose parents
   ## are ``parents``. The tree is built by ``git notes add -f -C`` on a work
   ## ref, so git chooses the fanout; the commit is made once, here.
-  let work = WorkRefPrefix & uniqueSuffix()
+  let work = workRefName(WorkRefPrefix)
   var tree = ""
   try:
     if base.len > 0:
@@ -344,6 +350,25 @@ proc buildNotesCommit(
     if not resolved.ok:
       return (false, "", resolved.failure)
     tree = singleLine(resolved.stdout)
+    if changes.len > 0:
+      # The work ref is private, but a cleanup that misjudged it as stale
+      # (``work_refs``) would have let `git notes add` start again from
+      # nothing. Make sure the tree built is ``base`` plus every change.
+      if base.len > 0:
+        let descends =
+          gitRun(r.dir, ["merge-base", "--is-ancestor", base, work & "^{commit}"])
+        if not descends.started or descends.exitCode != 0:
+          return (false, "", "the work ref " & work & " lost its base while in use")
+      let built = readNotesTree(r, work)
+      if not built.ok:
+        return (false, "", built.problem)
+      for (annotated, blob) in changes:
+        if annotated notin built.tree or built.tree[annotated].blob != blob:
+          return (
+            false,
+            "",
+            "the work ref " & work & " lost the note on " & annotated & " while in use",
+          )
   finally:
     discard git(r.dir, ["update-ref", "-d", work])
   var args = @["commit-tree", tree]
@@ -485,6 +510,7 @@ proc publishNotes*(
     result.problems.add r.problem
     return
   result.notesRef = r.notesRef
+  collectStaleWorkRefs(r)
   let resolved = resolveCommits(dir, revisions)
   if not resolved.ok:
     result.problems.add resolved.problem
@@ -711,7 +737,7 @@ proc fetchRemoteRef(
 ): tuple[ok, present: bool, oid, problem: string] =
   ## The remote's notes ref, fetched into a private ref (whose objects stay
   ## after the ref is deleted). ``present`` false: the remote has none.
-  let temporary = FetchRefPrefix & uniqueSuffix()
+  let temporary = workRefName(FetchRefPrefix)
   try:
     let fetched = gitRun(
       r.dir,
@@ -874,6 +900,7 @@ proc fetchNotes*(dir, remote: string, notesRef = ""): SyncReport =
     result.problems.add r.problem
     return
   result.notesRef = r.notesRef
+  collectStaleWorkRefs(r)
   if remote.len == 0 or remote.startsWith("-"):
     result.problems.add "`" & remote & "` is not a remote"
     return
@@ -892,23 +919,24 @@ proc fetchNotes*(dir, remote: string, notesRef = ""): SyncReport =
 type PushVerdict = enum
   pvAccepted
   pvUpToDate
-  pvRejectedStale ## The remote ref moved: fetch, merge, retry.
+  pvRejected
+    ## The remote refused the update. Whether that was a lost race is decided
+    ## by reading the remote ref again (``classifyRejection``), never from
+    ## the reason the server gives.
   pvFailed
 
 proc pushOnce(
     r: NotesRepo, remote, commit: string, runHooks: bool, deadline = Deadline()
 ): tuple[verdict: PushVerdict, detail: string] =
   ## Push ``commit`` to the remote notes ref without force, and classify the
-  ## answer from ``--porcelain`` (one ``<flag> TAB <from>:<to> TAB
-  ## <summary>`` line per ref on stdout; git-push(1), "OUTPUT").
-  ##
-  ## The flag column is locale-independent; the bracketed summary and the
-  ## reason after it are read too, so the push runs with ``LC_ALL=C`` (and
-  ## ``LANGUAGE`` cleared, which GNU gettext consults before ``LC_ALL``):
-  ## the local git, and a ``receive-pack`` it starts for a local or ``file://``
-  ## remote, then answer in English whatever the user's locale. A remote
-  ## server's own reason text is beyond reach; a reason this does not
-  ## recognise is reported as a failure, never retried blind.
+  ## answer by the flag column of ``--porcelain`` (one ``<flag> TAB
+  ## <from>:<to> TAB <summary>`` line per ref on stdout; git-push(1),
+  ## "OUTPUT"), which is locale-independent. The summary and stderr are only
+  ## carried along, for the report: a server's reason text is in its own
+  ## wording and locale, so nothing is decided by it. The push runs with
+  ## ``LC_ALL=C`` (and ``LANGUAGE`` cleared, which GNU gettext consults before
+  ## ``LC_ALL``) so that at least the local part of a report reads the same
+  ## everywhere.
   var args = @[
     "push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", "--no-signed"
   ]
@@ -935,29 +963,9 @@ proc pushOnce(
     of '=':
       return (pvUpToDate, fields[2])
     of '!':
-      let summary = fields[2]
-      # `[rejected]`: the client saw the remote ref move. `[remote
-      # rejected]` with a lock failure: the remote saw it move while
-      # updating, which is what two pushes that both CREATE the ref get
-      # (measured: "reference already exists"), and what a push losing the
-      # ref lock or its compare-and-swap gets ("cannot lock ref", "failed to
-      # lock", "incorrect old value provided"). Both are a
-      # lost race, retried. Any other remote rejection (a hook, a
-      # permission) is not.
-      if summary.startsWith("[rejected]") and (
-        "fetch first" in summary or "non-fast-forward" in summary or
-        "stale info" in summary
-      ):
-        return (pvRejectedStale, summary)
-      if summary.startsWith("[remote rejected]") and (
-        "reference already exists" in summary or "cannot lock ref" in summary or
-        "failed to lock" in summary or "failed to update ref" in summary or
-        "incorrect old value" in summary
-      ):
-        return (pvRejectedStale, summary)
       return (
-        pvFailed,
-        summary & (if run.stderr.strip().len > 0: ": " & run.stderr.strip()
+        pvRejected,
+        fields[2] & (if run.stderr.strip().len > 0: ": " & run.stderr.strip()
         else: ""),
       )
     else:
@@ -966,6 +974,69 @@ proc pushOnce(
     return (pvAccepted, "")
   (pvFailed, run.stderr.strip())
 
+proc remoteRefValue(
+    r: NotesRepo, remote: string, deadline = Deadline()
+): tuple[ok, present: bool, oid, problem: string] =
+  ## The remote's notes ref as the remote has it now, by ``git ls-remote``
+  ## (which fetches nothing). ``present`` false: the remote has none.
+  let listed = gitRun(
+    r.dir,
+    ["ls-remote", "--refs", "--end-of-options", remote, r.notesRef],
+    timeoutMs = deadline.remainingMs,
+  )
+  if not listed.started:
+    return (false, false, "", listed.failure)
+  if listed.exitCode != 0:
+    return (
+      false,
+      false,
+      "",
+      "could not list " & r.notesRef & " on " & remote & ": " & listed.stderr.strip(),
+    )
+  for line in listed.stdout.splitLines():
+    let fields = line.split('\t')
+    if fields.len == 2 and fields[1] == r.notesRef and r.isOid(fields[0]):
+      return (true, true, fields[0], "")
+  (true, false, "", "")
+
+type Rejection = enum
+  rjLostRace ## The remote ref moved to a value the pushed commit lacks.
+  rjAlreadyThere ## The remote ref already holds the pushed commit.
+  rjUnexplained ## The remote ref did not move past what was pushed.
+  rjUnknown ## The remote ref could not be read.
+
+proc classifyRejection(
+    r: NotesRepo, remote, pushed: string, deadline = Deadline()
+): tuple[kind: Rejection, remoteOid, problem: string] =
+  ## Why a non-forced push of ``pushed`` was refused, told from what the
+  ## remote ref holds NOW rather than from the server's text: a ref that
+  ## holds a commit ``pushed`` does not contain (one this repository does
+  ## not have at all, or one that is not an ancestor of ``pushed``) moved
+  ## under the push, which is a lost race; any other value — absent, or an
+  ## ancestor of ``pushed``, so that the push would have been a fast-forward
+  ## — means the update itself was refused (a hook, a permission, a
+  ## protected ref), or that a concurrent update holding the ref's lock has
+  ## not landed yet. The caller tells those two apart by trying again.
+  let now = remoteRefValue(r, remote, deadline)
+  if not now.ok:
+    return (rjUnknown, "", now.problem)
+  if not now.present:
+    return (rjUnexplained, "", "")
+  if now.oid == pushed:
+    return (rjAlreadyThere, now.oid, "")
+  let have = gitRun(r.dir, ["cat-file", "-e", now.oid & "^{commit}"])
+  if not have.started:
+    return (rjUnknown, now.oid, have.failure)
+  if have.exitCode != 0:
+    return (rjLostRace, now.oid, "")
+  let contained = isAncestor(r, now.oid, pushed)
+  if not contained.ok:
+    return (rjUnknown, now.oid, contained.problem)
+  if contained.answer:
+    (rjUnexplained, now.oid, "")
+  else:
+    (rjLostRace, now.oid, "")
+
 proc pushNotes*(
     dir, remote: string, notesRef = "", options = defaultPushOptions()
 ): SyncReport =
@@ -973,11 +1044,19 @@ proc pushNotes*(
   ## has moved, fetch it, union-merge it into the local ref and try again,
   ## with exponential backoff and jitter, ``options.attempts`` times in all.
   ## With ``options.timeoutMs``, all of it is bounded by that budget.
+  ##
+  ## A refused push is a lost race when, read again right after, the remote
+  ## ref holds a commit the pushed one does not contain
+  ## (``classifyRejection``); the server's reason text decides nothing, so a
+  ## server in another locale or with its own wording is handled alike. A
+  ## refusal while the remote ref has not moved past what was pushed is tried
+  ## once more and then reported as a failure.
   let r = openNotesRepo(dir, notesRef)
   if not r.ok:
     result.problems.add r.problem
     return
   result.notesRef = r.notesRef
+  collectStaleWorkRefs(r)
   if remote.len == 0 or remote.startsWith("-"):
     result.problems.add "`" & remote & "` is not a remote"
     return
@@ -994,6 +1073,11 @@ proc pushNotes*(
     else:
       false
 
+  # When the current round (fetch, merge, push) began; see the backoff below.
+  var roundStart = getMonoTime()
+  # The remote value a refusal that was not a lost race was last seen
+  # against; see `rjUnexplained`.
+  var refusedAt = ""
   for attempt in 1 .. attempts:
     result.attempts = attempt
     if outOfTime():
@@ -1022,23 +1106,61 @@ proc pushNotes*(
       result.problems.add "pushing " & r.notesRef & " to " & remote & " failed: " &
         pushed.detail
       return
-    of pvRejectedStale:
-      result.remarks.add "attempt " & $attempt & ": the remote " & r.notesRef &
-        " moved (" & pushed.detail & "); fetching and merging"
-      if attempt == attempts:
-        break
+    of pvRejected:
+      let why = classifyRejection(r, remote, current.oid, deadline)
+      case why.kind
+      of rjAlreadyThere:
+        # Another writer pushed this very commit meanwhile.
+        result.outcome = soUpToDate
+        result.notesCommit = current.oid
+        result.ok = true
+        return
+      of rjUnknown:
+        result.problems.add "pushing " & r.notesRef & " to " & remote & " was refused (" &
+          pushed.detail & "), and whether the remote ref moved could not be told: " &
+          why.problem
+        return
+      of rjUnexplained:
+        # Refused although the push would have been a fast-forward of what
+        # the remote holds. A refusal of the update itself (a hook, a
+        # permission) repeats against the same value; a concurrent update
+        # that held the ref's lock and had not landed when the remote was
+        # read does not. So the first such refusal is tried once more, and a
+        # second one against the same remote value is the answer.
+        let at = if why.remoteOid.len > 0: why.remoteOid else: "(absent)"
+        if refusedAt == at or attempt == attempts:
+          result.problems.add "pushing " & r.notesRef & " to " & remote &
+            " was refused: " & pushed.detail
+          return
+        refusedAt = at
+        result.remarks.add "attempt " & $attempt & ": the remote refused " & r.notesRef &
+          " without it having moved (" & pushed.detail & "); trying once more"
+      of rjLostRace:
+        refusedAt = ""
+        result.remarks.add "attempt " & $attempt & ": the remote " & r.notesRef &
+          " moved (" & pushed.detail & "); fetching and merging"
+        if attempt == attempts:
+          break
       # Back off BEFORE fetching, so the merge pushed next is as fresh as it
       # can be. "Full jitter" (a uniform draw over the whole, doubling
       # window) rather than a fixed delay plus a little noise: pushers that
       # lost the same round would otherwise sleep alike and race again in
-      # lockstep, one winning per round.
+      # lockstep, one winning per round. The window is never shorter than
+      # the round just lost took: draws spread over less than one round
+      # still overlap. Where starting a process is slow (Windows), a round
+      # takes several times the 100 ms base, and six clones then still
+      # failed within five attempts; measured on x86_64-linux a round is
+      # well under the base, so the base decides there.
       if options.baseDelayMs > 0:
-        var pause = rng.rand(options.baseDelayMs * (1 shl (attempt - 1)))
+        let roundMs = int((getMonoTime() - roundStart).inMilliseconds)
+        let window = max(options.baseDelayMs, roundMs) * (1 shl (attempt - 1))
+        var pause = rng.rand(window)
         if deadline.limited:
           pause = min(pause, deadline.remainingMs)
         sleep(pause)
       if outOfTime():
         return
+      roundStart = getMonoTime()
       let fetched = fetchRemoteRef(r, remote, deadline)
       if not fetched.ok:
         result.problems.add fetched.problem
