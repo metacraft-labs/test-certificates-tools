@@ -94,11 +94,40 @@ proc beingWritten(dir: string, now: Time, noFollow = false): bool =
   false
 
 when not defined(windows):
+  when defined(macosx):
+    var FGetPath {.importc: "F_GETPATH", header: "<fcntl.h>".}: cint
+    proc fcntlGetPath(
+      fd: cint, cmd: cint, buf: cstring
+    ): cint {.importc: "fcntl", header: "<fcntl.h>", varargs.}
+
   proc descriptorPath(fd: cint): string =
+    ## A path that names the directory ``fd`` holds, through which its
+    ## entries can be reached by name. Raises ``OSError`` when there is none.
+    ##
+    ## Linux: ``/proc/self/fd/<fd>``, which stays anchored to the held
+    ## directory even if it is renamed. macOS has no such path: ``/dev/fd/<fd>``
+    ## (fdesc) opens a copy of the descriptor but cannot be traversed, so
+    ## ``/dev/fd/<fd>/v1`` does not exist and the store looked empty. There the
+    ## held directory's current path comes from ``fcntl(F_GETPATH)``, and is
+    ## used only if it still names the held directory (same device and inode).
+    ## It is not anchored against a rename after that check; every system-store
+    ## step below re-opens each level with ``O_NOFOLLOW`` and compares
+    ## identities, as on Linux.
+    ## https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html
     when defined(linux):
       "/proc/self/fd/" & $fd
+    elif defined(macosx):
+      var buf = newString(1024) # MAXPATHLEN, as F_GETPATH requires
+      if fcntlGetPath(fd, FGetPath, buf.cstring) == -1:
+        raiseOSError(osLastError(), "could not find the path of a held directory")
+      buf.setLen(buf.cstring.len)
+      var held, named: Stat
+      if fstat(fd, held) != 0 or lstat(buf.cstring, named) != 0 or
+          held.st_dev != named.st_dev or held.st_ino != named.st_ino:
+        raise newException(OSError, "a held directory moved: '" & buf & "'")
+      buf
     else:
-      "/dev/fd/" & $fd
+      raise newException(OSError, "no descriptor-anchored paths on this platform")
 
   proc inspectSystemTree(fd: cint, shown: string, policy: StorePolicy): string =
     ## Preflight every directory, including interrupted-prune leftovers,
@@ -126,7 +155,12 @@ when not defined(windows):
   proc removeSystemTree(fd: cint, policy: StorePolicy): string =
     ## Delete only through held directory descriptors. In particular, an
     ## unlinked symbolic-link entry never becomes a traversal during cleanup.
-    result = checkAccess(fd, descriptorPath(fd), policy)
+    let shown =
+      try:
+        descriptorPath(fd)
+      except OSError as err:
+        return "could not find the system cleanup directory: " & err.msg
+    result = checkAccess(fd, shown, policy)
     if result.len > 0:
       return
     try:
@@ -233,14 +267,13 @@ proc pruneRoot*(
       # Paths through an opened descriptor keep the root anchored if another
       # producer renames it. Each system descendant is opened and checked in
       # turn before it is enumerated or mutated.
-      when defined(linux):
-        anchoredRoot = "/proc/self/fd/" & $fd
-      elif defined(macosx):
-        anchoredRoot = "/dev/fd/" & $fd
-      else:
+      try:
+        anchoredRoot = descriptorPath(fd)
+      except OSError as err:
         if system:
-          result.errors.add "system pruning needs descriptor-anchored paths on this platform"
+          result.errors.add "system pruning needs a path to the held root: " & err.msg
           return
+        anchoredRoot = root # a user root: prune it by its own path
 
   var heldLayout = anchoredRoot / LayoutVersion
   when not defined(windows):
@@ -260,7 +293,11 @@ proc pruneRoot*(
       if problem.len > 0:
         result.errors.add problem
         return
-      heldLayout = anchoredRoot.parentDir / $fd
+      try:
+        heldLayout = descriptorPath(fd)
+      except OSError as err:
+        result.errors.add "could not find the held layout directory: " & err.msg
+        return
   var protectedDirs: seq[string]
   for id in protectedIds:
     let parsed = parseContentId(id)
@@ -297,7 +334,7 @@ proc pruneRoot*(
             result.ok = false
             result.errors.add problem
             return
-          heldAlgorithm = anchoredRoot.parentDir / $fd
+          heldAlgorithm = descriptorPath(fd) # raises into the listing's handler
       for digestKind, digestPath in walkDir(heldAlgorithm, checkDir = true):
         let name = digestPath.extractFilename
         when not defined(windows):
