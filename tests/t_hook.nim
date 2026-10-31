@@ -1181,6 +1181,46 @@ suite "hook pre-push, the git it runs":
       check not report.propagated
       check report.problems.anyIt("cannot be told" in it)
 
+    test "the_work_ref_is_deleted_when_the_budget_runs_out_while_it_is_in_use":
+      # `NotesRepo.dropWorkRef` is outside the deadline on purpose: the command
+      # the deadline just stopped is why it runs. The stall is at `notes add`,
+      # the one command that holds the work ref, and the recording made there
+      # shows the ref really existed, so its absence afterwards is a deletion.
+      let scratch = scratchDir()
+      defer:
+        cleanup(scratch)
+      let remote = newBareRemote(scratch)
+      let a = newClone(scratch, remote, "a")
+      let first = commitFile(a, "f", "one\n")
+      certify(a, first)
+      check tc(a, ["notes", "publish", "HEAD"]).exitCode == 0
+      let tree = commitFile(a, "f", "two\n")
+      let tip = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+      certify(a, tree, "t-second")
+      let before = gitIn(a.dir, ["rev-parse", Ref]).strip()
+      let seen = scratch / "seen"
+      let real = findExe("git")
+      var options = defaultHookOptions()
+      options.push.timeoutMs = 2000
+      options.push.gitExe = gitWrapper(
+        scratch / "stalling-git",
+        real,
+        "case \"$1\" in notes) " & quoteShell(real) & " for-each-ref " & WorkRefPrefix &
+          " > " & quoteShell(seen) & "; exec sleep " & $StallSeconds & ";; esac",
+      )
+      let started = getMonoTime()
+      let report = prePushHook(
+        a.dir, "", remote, pushLine(tip, zeros()), StoreRoots(user: a.store), options
+      )
+      let took = millisSince(started)
+      checkpoint report.problems.join("\n")
+      check took < WithinBudgetMs
+      check not report.propagated
+      check not report.pushRan
+      check WorkRefPrefix in readFile(seen)
+      check gitIn(a.dir, ["for-each-ref", WorkRefPrefix]).len == 0
+      check gitIn(a.dir, ["rev-parse", Ref]).strip() == before
+
     proc ignoringLazyFetchVariable(scratch: string): HookOptions =
       ## A git that behaves as one too old to know ``GIT_NO_LAZY_FETCH``
       ## (measured: 2.38.5), whatever the git on this host is.
