@@ -20,6 +20,11 @@
 ##   commits made by ``git fast-import``; in-process, so the allocator's
 ##   high-water mark can be read. Batched scoped trees choose what one batch
 ##   chooses.
+## * Partial clones: real `--filter` clones over a real transport. A remote
+##   object the clone lacks gives §4.2's commit set and no network operation;
+##   declared scopes read no blob; a tree or a note the clone lacks, with a
+##   promisor that never answers, stays inside the budget; a note it lacks is
+##   still fetched when the promisor answers.
 ##
 ## Most hooks here are a two-line script that counts its invocations and
 ## then execs the built binary by absolute path, so the count observes
@@ -31,7 +36,7 @@
 ## crash of the binary cannot be provoked on demand and what is under test is
 ## the installed hook script's answer to one.
 
-import std/[monotimes, sequtils, unittest]
+import std/[monotimes, sequtils, tables, unittest]
 import ./helpers
 import test_certificates
 
@@ -616,3 +621,362 @@ suite "hook pre-push, long histories":
     let whole = hookInProcess(a, remote, tip, batchTrees = Commits + 1)
     check whole.certified == small.certified
     check whole.introducedCount == Commits
+
+# ---------------------------------------------------------------------------
+# Partial clones (Tooling §4.2, §4.3)
+# ---------------------------------------------------------------------------
+
+const
+  StallSeconds = 20
+  HookBudget = ("TEST_CERTIFICATES_HOOK_TIMEOUT", "2")
+    ## Far below the stall, so a hook that waits for the stall cannot pass.
+  WithinBudgetMs = 15_000
+    ## A generous bound for a 2 s budget on a slow machine, still below the
+    ## 20 s stall a single unbudgeted command would wait for.
+
+proc fileUrl(path: string): string =
+  ## A filter is only honoured over a real transport; a plain path is copied
+  ## by the local clone optimisation, whole.
+  when defined(windows):
+    "file:///" & path.replace('\\', '/')
+  else:
+    "file://" & path
+
+proc newPartialClone(scratch, remote, name, filter: string): Clone =
+  ## A real partial clone of ``remote``, with no worktree, so that it holds no
+  ## blob the checkout would have fetched.
+  discard gitIn(remote, ["config", "uploadpack.allowFilter", "true"])
+  result.dir = scratch / name
+  result.store = scratch / (name & "-store")
+  discard gitIn(
+    scratch,
+    ["clone", "-q", "--no-checkout", "--filter=" & filter, fileUrl(remote), result.dir],
+  )
+  result.env = isolatedEnv(scratch, result.store)
+
+proc isAbsent(c: Clone, oid: string): bool =
+  ## Whether this clone lacks the object, asked so that asking cannot fetch it.
+  gitWith(c.dir, ["cat-file", "-e", oid], [NoLazyFetch]).exitCode != 0
+
+proc stallPromisor(c: Clone): seq[(string, string)] =
+  ## Point the clone's promisor remote at a helper that never answers
+  ## (`ext::sleep`, the same real stall as "one that never answers" above),
+  ## and answer the environment that allows that transport.
+  discard gitIn(c.dir, ["remote", "set-url", "origin", "ext::sleep " & $StallSeconds])
+  @[
+    HookBudget,
+    ("GIT_CONFIG_COUNT", "1"),
+    ("GIT_CONFIG_KEY_0", "protocol.ext.allow"),
+    ("GIT_CONFIG_VALUE_0", "always"),
+  ]
+
+proc newTree(c: Clone, name, text: string): string =
+  ## A tree of one file, written without a worktree or an index.
+  let blob = gitIn(c.dir, ["hash-object", "-w", "--stdin"], input = text).strip()
+  gitIn(c.dir, ["mktree"], input = "100644 blob " & blob & "\t" & name & "\n").strip()
+
+proc commitOn(c: Clone, tree, parent: string): string =
+  gitIn(c.dir, ["commit-tree", "-m", "x", "-p", parent, tree]).strip()
+
+proc seedRemote(scratch: string): tuple[remote: string, seed: Clone] =
+  ## A remote whose ``main`` has two commits, with a directory and a file.
+  result.remote = newBareRemote(scratch)
+  result.seed = newClone(scratch, result.remote, "seed")
+  createDir(result.seed.dir / "src")
+  writeFile(result.seed.dir / "src" / "f", "one\n")
+  writeFile(result.seed.dir / "other", "x\n")
+  commitAll(result.seed.dir, "first")
+  writeFile(result.seed.dir / "src" / "f", "two\n")
+  commitAll(result.seed.dir, "second")
+  doAssert push(result.seed, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+
+proc pushLine(local, remoteOid: string): string =
+  "refs/heads/x " & local & " refs/heads/main " & remoteOid & "\n"
+
+proc millisSince(start: MonoTime): int64 =
+  (getMonoTime() - start).inMilliseconds
+
+suite "hook pre-push, partial clones":
+  test "a_remote_object_the_clone_lacks_makes_no_network_operation_with_a_stalled_promisor":
+    # §4.3: nothing to carry, no network operation. The remote object is the
+    # one §4.2 names, and looking it up used to make a lazy fetch.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (remote, seed) = seedRemote(scratch)
+    let p = newPartialClone(scratch, remote, "partial", "blob:none")
+    let main = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+    discard commitFile(seed, "g", "moved on\n")
+    check push(seed, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+    let moved = gitIn(seed.dir, ["rev-parse", "HEAD"]).strip()
+    check isAbsent(p, moved)
+    let mine = commitOn(p, newTree(p, "m", "mine\n"), main)
+    let stall = stallPromisor(p)
+    let trace = scratch / "trace"
+    let started = getMonoTime()
+    let run = hookDirect(p, pushLine(mine, moved), extra = stall & ("GIT_TRACE", trace))
+    let took = millisSince(started)
+    checkpoint run.errors
+    check run.exitCode == 0
+    check "no stored certificates for the 1 commit(s)" in run.errors
+    check "warning" notin run.errors
+    # Not "within the budget": no time spent, and no fetch even attempted.
+    check took < WithinBudgetMs
+    check " fetch " notin readFile(trace)
+    check isAbsent(p, moved)
+
+  test "a_remote_object_the_clone_lacks_gives_the_commit_set_of_section_4_2":
+    # §4.2's table, third and fourth rows, with the old value really absent:
+    # everything new is introduced, what the tracking refs reach is not, and
+    # the unknown object is never treated as an exclusion it cannot be.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (remote, seed) = seedRemote(scratch)
+    let p = newPartialClone(scratch, remote, "partial", "blob:none")
+    let main = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+    discard commitFile(seed, "g", "moved on\n")
+    check push(seed, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+    let moved = gitIn(seed.dir, ["rev-parse", "HEAD"]).strip()
+    check isAbsent(p, moved)
+    let middleTree = newTree(p, "m", "middle\n")
+    let tipTree = newTree(p, "m", "tip\n")
+    let middle = commitOn(p, middleTree, main)
+    let tip = commitOn(p, tipTree, middle)
+    let publishedTree = treeOf(p.dir, main)
+    certify(p, middleTree)
+    certify(p, tipTree)
+    certify(p, publishedTree) # On the remote already: not introduced.
+
+    let tracked = hookDirect(p, pushLine(tip, moved))
+    checkpoint tracked.errors
+    check tracked.exitCode == 0
+    check "2 certified tree(s) among 2 pushed commit(s)" in tracked.errors
+    check remoteKeys(remote) == toHashSet([middleTree, tipTree])
+    check isAbsent(p, moved)
+
+    # No remote-tracking refs stand in for a URL: the whole history counts.
+    let byUrl = hookDirect(p, pushLine(tip, moved), [remote, remote])
+    checkpoint byUrl.errors
+    check byUrl.exitCode == 0
+    check "among 4 pushed commit(s)" in byUrl.errors
+    check remoteKeys(remote) == toHashSet([middleTree, tipTree, publishedTree])
+    check isAbsent(p, moved)
+
+    # Another entry's absent remote object excludes nothing either, and does
+    # not stop the entry whose remote object is known.
+    let mixed = hookDirect(
+      p,
+      pushLine(tip, main) & "refs/heads/y " & tip & " refs/heads/y " & moved & "\n",
+      [remote, remote],
+    )
+    checkpoint mixed.errors
+    check mixed.exitCode == 0
+    check "warning" notin mixed.errors
+    check "among 2 pushed commit(s)" in mixed.errors
+
+  test "declared_scopes_read_no_blob_of_a_blob_none_clone":
+    # `write-tree` checks every entry's object, which in a partial clone
+    # fetches them all, so a scope made every push reach the promisor.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (remote, seed) = seedRemote(scratch)
+    let p = newPartialClone(scratch, remote, "partial", "blob:none")
+    let main = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+    discard gitIn(p.dir, ["config", "testCertificatesScope.s.path", "src"])
+    let blob = gitIn(p.dir, ["rev-parse", "origin/main:src/f"]).strip()
+    check isAbsent(p, blob)
+    let tree = treeOf(p.dir, main)
+    # The same scoped tree as a clone that has every blob computes.
+    let scope = DeclaredScope(names: @["s"], paths: @["src"])
+    let full = scopedTrees(seed.dir, 40, [tree], [scope])
+    check full.ok
+    let scoped = full.trees[tree][0]
+    # A commit of the same tree, new to the remote: pushed to a URL, so its
+    # history is what is introduced.
+    let again = commitOn(p, tree, main)
+
+    # Nothing certified, promisor stalled: nothing touches it.
+    let answering = gitIn(p.dir, ["remote", "get-url", "origin"]).strip()
+    let stall = stallPromisor(p)
+    let started = getMonoTime()
+    let quiet = hookDirect(p, pushLine(again, zeros()), [remote, remote], stall)
+    let took = millisSince(started)
+    checkpoint quiet.errors
+    check quiet.exitCode == 0
+    check "warning" notin quiet.errors
+    check took < WithinBudgetMs
+    check isAbsent(p, blob)
+
+    # Certified in the scope: published under that same tree, still no blob.
+    discard gitIn(p.dir, ["remote", "set-url", "origin", answering])
+    certify(p, scoped)
+    let carried = hookDirect(p, pushLine(again, zeros()), [remote, remote])
+    checkpoint carried.errors
+    check carried.exitCode == 0
+    check "warning" notin carried.errors
+    check remoteKeys(remote) == toHashSet([scoped])
+    check isAbsent(p, blob)
+
+  test "a_tree_the_clone_lacks_is_reported_within_the_budget":
+    # A tree:0 clone cannot tell what a scope selects without fetching, and
+    # with nothing known to carry the hook may not fetch: reported, not waited
+    # for, and the push goes on.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (remote, seed) = seedRemote(scratch)
+    let p = newPartialClone(scratch, remote, "partial", "tree:0")
+    discard commitFile(seed, "g", "moved on\n")
+    check push(seed, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+    discard gitIn(p.dir, ["fetch", "-q", "origin"])
+    let fetched = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+    let tree = gitIn(p.dir, ["log", "-1", "--format=%T", fetched]).strip()
+    check isAbsent(p, tree)
+    discard gitIn(p.dir, ["config", "testCertificatesScope.s.path", "src"])
+    let stall = stallPromisor(p)
+    let started = getMonoTime()
+    let run = hookDirect(p, pushLine(fetched, zeros()), [remote, remote], stall)
+    let took = millisSince(started)
+    checkpoint run.errors
+    check run.exitCode == 0
+    check "could not read trees for the declared scopes" in run.errors
+    check took < WithinBudgetMs
+    check isAbsent(p, tree)
+
+  proc withAbsentNote(
+      scratch: string, certifyTree = true
+  ): tuple[remote: string, seed, p: Clone, mine, tree: string] =
+    ## A partial clone holding the remote's notes ref but not the blob of the
+    ## note on ``tree``, with (``certifyTree``) its own certificate for that
+    ## tree, and a new commit of it to push.
+    let (remote, seed) = seedRemote(scratch)
+    let p = newPartialClone(scratch, remote, "partial", "blob:none")
+    let main = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+    let tree = treeOf(p.dir, main)
+    certify(seed, tree, "t-seed")
+    check tc(seed, ["notes", "publish", "HEAD"]).exitCode == 0
+    check tc(seed, ["notes", "push", "origin"]).exitCode == 0
+    discard gitIn(p.dir, ["fetch", "-q", "origin", "+" & Ref & ":" & Ref])
+    let note = gitIn(p.dir, ["rev-parse", Ref & ":" & tree]).strip()
+    doAssert isAbsent(p, note)
+    if certifyTree:
+      certify(p, tree, "t-partial")
+    (remote, seed, p, commitOn(p, tree, main), tree)
+
+  test "a_note_the_clone_lacks_is_fetched_when_the_promisor_answers":
+    # The lazy fetch the hook must keep: a note is added to, never overwritten.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (remote, _, p, mine, tree) = withAbsentNote(scratch)
+    let run = hookDirect(p, pushLine(mine, zeros()), [remote, remote])
+    checkpoint run.errors
+    check run.exitCode == 0
+    check "warning" notin run.errors
+    check noteBlob(remote, tree).splitNote().len == 2
+
+  test "a_note_the_clone_lacks_stays_within_the_budget_when_the_promisor_stalls":
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (remote, _, p, mine, tree) = withAbsentNote(scratch)
+    let before = gitIn(remote, ["rev-parse", Ref]).strip()
+    let localBefore = gitIn(p.dir, ["rev-parse", Ref]).strip()
+    let stall = stallPromisor(p)
+    let started = getMonoTime()
+    let run = hookDirect(p, pushLine(mine, zeros()), [remote, remote], stall)
+    let took = millisSince(started)
+    checkpoint run.errors
+    check run.exitCode == 0
+    check "cannot read note blob" in run.errors
+    check "certificates were NOT fully propagated" in run.errors
+    check took < WithinBudgetMs
+    # Nothing was overwritten, here or there, and no work ref was left behind.
+    check gitIn(remote, ["rev-parse", Ref]).strip() == before
+    check gitIn(p.dir, ["rev-parse", Ref]).strip() == localBefore
+    check gitIn(p.dir, ["for-each-ref", "refs/test-certificates/"]).len == 0
+    check noteBlob(remote, tree).splitNote().len == 1
+
+  test "the_merge_after_a_lost_race_stays_within_the_budget_when_the_promisor_stalls":
+    # The notes go to a second remote that answers, whose notes moved. Merging
+    # needs the note this clone lacks, which only the stalled promisor can
+    # give: that read is inside the push's budget too.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (remote, seed, p, mine, tree) = withAbsentNote(scratch, certifyTree = false)
+    let second = scratch / "second.git"
+    discard gitIn(scratch, ["clone", "-q", "--bare", remote, second])
+    discard gitIn(second, ["fetch", "-q", remote, "+" & Ref & ":" & Ref])
+    certify(seed, tree, "t-moved-on")
+    check tc(seed, ["notes", "publish", "HEAD"]).exitCode == 0
+    check push(seed, "-q", second, Ref & ":" & Ref).exitCode == 0
+    discard gitIn(p.dir, ["remote", "add", "second", second])
+    # Something this clone can publish without reading the absent note.
+    let newTreeOid = newTree(p, "m", "new\n")
+    let newCommit = commitOn(p, newTreeOid, mine)
+    certify(p, newTreeOid)
+    let stall = stallPromisor(p)
+    let started = getMonoTime()
+    let run = hookDirect(
+      p,
+      "refs/heads/z " & newCommit & " refs/heads/z " & zeros() & "\n",
+      ["second", second],
+      stall,
+    )
+    let took = millisSince(started)
+    checkpoint run.errors
+    check run.exitCode == 0
+    # The merge was reached, so the remote was seen to have moved without
+    # fetching what it moved to, and it stopped at the note.
+    check "cannot read note blob" in run.errors
+    check "certificates were NOT fully propagated" in run.errors
+    check took < WithinBudgetMs
+
+  test "an_absent_local_object_is_reported_and_a_tag_of_an_absent_blob_is_not":
+    # §4.1 skips what is not a commit. An object that cannot be examined is not
+    # known to be one: skipping it could drop what the push introduces.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    let a = newClone(scratch, remote, "a")
+    discard commitFile(a, "f", "one\n")
+    let absent = repeat('1', 40)
+    proc tagOf(kind: string): string =
+      gitIn(
+        a.dir,
+        ["hash-object", "-t", "tag", "-w", "--stdin"],
+        input =
+          "object " & absent & "\ntype " & kind &
+          "\ntag t\ntagger T <t@example.invalid> 0 +0000\n\nm\n",
+      )
+        .strip()
+
+    let lost = hookDirect(a, pushLine(absent, zeros()))
+    checkpoint lost.errors
+    check lost.exitCode == 0
+    check "cannot be told" in lost.errors
+    check "certificates were NOT fully propagated" in lost.errors
+
+    let ofCommit = hookDirect(a, pushLine(tagOf("commit"), zeros()))
+    checkpoint ofCommit.errors
+    check ofCommit.exitCode == 0
+    check "cannot be told" in ofCommit.errors
+
+    let outer = gitIn(
+        a.dir,
+        ["hash-object", "-t", "tag", "-w", "--stdin"],
+        input =
+          "object " & tagOf("commit") &
+          "\ntype tag\ntag o\ntagger T <t@example.invalid> 0 +0000\n\nm\n",
+      )
+      .strip()
+    check "cannot be told" in hookDirect(a, pushLine(outer, zeros())).errors
+
+    let ofBlob = hookDirect(a, pushLine(tagOf("blob"), zeros()))
+    checkpoint ofBlob.errors
+    check ofBlob.exitCode == 0
+    check "warning" notin ofBlob.errors

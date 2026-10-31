@@ -55,6 +55,15 @@
 ## always finite) so an unresponsive remote cannot hold the user's push. With no
 ## certificates to carry, no network operation is made at all.
 ##
+## **Partial clones** (Tooling §4.3). In a partial clone git fetches an object
+## it lacks from the promisor remote, from inside commands that look local, and
+## nothing about those commands limits the time that takes. Deciding what a push
+## introduces, and whether any of it has certificates, therefore runs every
+## command with ``git.NoLazyFetch``: with nothing to carry there is no network
+## operation at all, and a remote object the clone lacks is simply absent, as
+## §4.2 expects. Only once there are certificates to carry may a lazy fetch run,
+## to read a note the clone lacks, and then inside the same budget as the push.
+##
 ## **Never failing.** ``prePushHook`` returns a report; nothing in it is a
 ## reason to refuse the push. ``propagated`` false with ``problems`` says
 ## certificates did not travel: the receiving gate decides what that means
@@ -171,13 +180,61 @@ proc isConfiguredRemote(dir, name: string): bool =
   let listed = git(dir, ["remote"])
   listed.ok and name in listed.stdout.splitLines()
 
-proc peeledCommit(dir, oid: string): string =
-  ## The commit ``oid`` is or peels to; "" when it is not one or is absent.
-  let run = gitRun(dir, ["rev-parse", "--verify", "--quiet", oid & "^{commit}"])
+proc peeledCommit(dir, oid: string, budget: Deadline): string =
+  ## The commit ``oid`` is or peels to; "" when it is not one or is absent from
+  ## this repository, which never fetches it. The time limit is for a git too
+  ## old to know ``NoLazyFetch``: a lookup is otherwise instant, and one the
+  ## limit stops is the answer "absent" (§4.2's table).
+  let run = gitRun(
+    dir,
+    ["rev-parse", "--verify", "--quiet", oid & "^{commit}"],
+    env = [NoLazyFetch],
+    timeoutMs = budget.remainingMs,
+  )
   if run.started and run.exitCode == 0:
     singleLine(run.stdout)
   else:
     ""
+
+proc whyNotPeelable(dir, oid: string, budget: Deadline): string =
+  ## ``oid`` did not peel to a commit: "" when that is because it is not one
+  ## (§4.1 skips it), and otherwise why that cannot be told, because the object
+  ## or what it tags is absent here. Skipping that entry silently could drop
+  ## commits the push introduces. A tag's header states what it tags, so a tag
+  ## of a blob the clone lacks is still known not to be a commit.
+  const MaxTagChain = 32
+  var at = oid
+  for _ in 1 .. MaxTagChain:
+    let kind = git(
+      dir, ["cat-file", "-t", at], env = [NoLazyFetch], timeoutMs = budget.remainingMs
+    )
+    if not kind.ok:
+      return at & " is not in this repository"
+    if singleLine(kind.stdout) != "tag":
+      return ""
+    let tag = git(
+      dir, ["cat-file", "tag", at], env = [NoLazyFetch], timeoutMs = budget.remainingMs
+    )
+    if not tag.ok:
+      return at & " cannot be read: " & tag.failure
+    var target, targetType: string
+    for line in tag.stdout.splitLines():
+      if line.len == 0:
+        break # The headers end at the first empty line.
+      if line.startsWith("object "):
+        target = line["object ".len ..^ 1]
+      elif line.startsWith("type "):
+        targetType = line["type ".len ..^ 1]
+    case targetType
+    of "tree", "blob":
+      return ""
+    of "commit":
+      return "the commit " & target & " that it tags is not in this repository"
+    of "tag":
+      at = target
+    else:
+      return "the tag " & at & " cannot be parsed"
+  "its chain of tags is longer than " & $MaxTagChain
 
 proc storedDigests(
     roots: StoreRoots, algorithm: ContentAlgorithm
@@ -239,7 +296,7 @@ proc flush(s: Selection): bool =
   var trees: seq[string]
   for tree in s.batch.keys:
     trees.add tree
-  let scoped = scopedTrees(s.dir, s.hexLen, trees, s.scopes)
+  let scoped = scopedTrees(s.dir, s.hexLen, trees, s.scopes, [NoLazyFetch])
   if not scoped.ok:
     s.problem = scoped.problem
     return false
@@ -299,6 +356,7 @@ proc listInto(
     s.dir,
     @["rev-list", "--format=%T", "--stdin"] & @options,
     input = revisionLines(revisions),
+    env = [NoLazyFetch],
     onStdout = sink,
   )
   if s.problem.len > 0:
@@ -337,12 +395,21 @@ proc prePushHook*(
     result.propagated = false
     return
 
+  let budgetMs =
+    if options.push.timeoutMs > 0: options.push.timeoutMs else: DefaultHookTimeoutMs
+  # Only a git that ignores `NoLazyFetch` can spend any of this (`peeledCommit`).
+  let lookups = deadlineIn(budgetMs)
+
   # Which refs count, and what the remote is known to have.
   var considered: seq[(PushedRef, string)] # The ref and its local commit.
   var onRemote: seq[string] # Remote objects this repository has.
+  var remoteCommit = initTable[string, string]()
+    # Each remote object's commit, "" when absent: looked up once, so that the
+    # two uses of the answer below cannot disagree.
   for r in parsed.refs:
-    if not r.remoteOid.isZero:
-      let have = peeledCommit(dir, r.remoteOid)
+    if not r.remoteOid.isZero and r.remoteOid notin remoteCommit:
+      let have = peeledCommit(dir, r.remoteOid, lookups)
+      remoteCommit[r.remoteOid] = have
       if have.len > 0:
         onRemote.add have
   for r in parsed.refs:
@@ -352,9 +419,15 @@ proc prePushHook*(
     if r.localRef.startsWith(NotesRefPrefix) or r.remoteRef.startsWith(NotesRefPrefix):
       result.skipped.add r.remoteRef & ": a notes ref, pushed as it is"
       continue
-    let local = peeledCommit(dir, r.localOid)
+    let local = peeledCommit(dir, r.localOid, lookups)
     if local.len == 0:
-      result.skipped.add r.remoteRef & ": " & r.localOid & " is not a commit"
+      let why = whyNotPeelable(dir, r.localOid, lookups)
+      if why.len > 0:
+        result.problems.add "what the push to " & r.remoteRef &
+          " introduces cannot be told: " & why
+        result.propagated = false
+      else:
+        result.skipped.add r.remoteRef & ": " & r.localOid & " is not a commit"
       continue
     considered.add (r, local)
   if considered.len == 0:
@@ -378,11 +451,7 @@ proc prePushHook*(
     # The ref, its commit, bounded by tracking refs.
   for wantTracked in [false, true]:
     for (r, local) in considered:
-      let remoteHas =
-        if r.remoteOid.isZero:
-          ""
-        else:
-          peeledCommit(dir, r.remoteOid)
+      let remoteHas = remoteCommit.getOrDefault(r.remoteOid)
       let usesTracked = remoteHas.len == 0 and tracked.len > 0
       if usesTracked == wantTracked:
         ordered.add (r, local, usesTracked)
@@ -421,6 +490,7 @@ proc prePushHook*(
         dir,
         @["rev-list", "--max-count=1", "--stdin"] & listOptions,
         input = revisionLines(revisions),
+        env = [NoLazyFetch],
       )
       if anything.ok and anything.stdout.strip().len == 0:
         continue
@@ -461,8 +531,12 @@ proc prePushHook*(
   if result.certified.len == 0:
     return
 
+  # From here there is something to carry, and the network may be used: the
+  # budget starts now and covers the publish (which may have to fetch a note
+  # this clone lacks) and the push alike.
+  let budget = deadlineIn(budgetMs)
   result.publishRan = true
-  result.published = publishNotes(dir, roots, result.certified)
+  result.published = publishNotes(dir, roots, result.certified, deadline = budget)
   result.remarks.add result.published.remarks
   for t in result.published.trees:
     for p in t.searchProblems:
@@ -474,10 +548,14 @@ proc prePushHook*(
     result.propagated = false
     # The certificates already in the local notes ref may still be pushed.
 
+  if budget.expired:
+    result.problems.add "the notes were not pushed: the time budget of " & $budgetMs &
+      " ms ran out"
+    result.propagated = false
+    return
   var pushOptions = options.push
   pushOptions.runHooks = false
-  if pushOptions.timeoutMs <= 0:
-    pushOptions.timeoutMs = DefaultHookTimeoutMs
+  pushOptions.timeoutMs = budget.remainingMs
   result.pushRan = true
   result.pushed = pushNotes(dir, result.target, options = pushOptions)
   result.remarks.add result.pushed.remarks

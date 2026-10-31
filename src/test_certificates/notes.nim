@@ -76,6 +76,11 @@ type
     gitExe*: string
       ## The git every notes-ref command for this repository runs
       ## (``git.gitRun``; ``openNotesRepo``).
+    deadline*: Deadline
+      ## When limited, no command for this repository outlives it. In a
+      ## partial clone any command that reads an object can make a lazy fetch
+      ## of a note the clone lacks, so it is not only the commands that name a
+      ## remote that can take as long as the network does.
     problem*: string
 
   NoteEntry = object
@@ -159,7 +164,8 @@ type
     timeoutMs*: int
       ## A wall-clock budget, in milliseconds, for everything the push does
       ## over the network: every push attempt, the fetches between them and
-      ## the backoff. 0 is no limit. A git command still running when the
+      ## the backoff, and the merges between them, which read notes a partial
+      ## clone may have to fetch. 0 is no limit. A git command still running when the
       ## budget runs out is stopped (POSIX; see ``git.runProcess``) and the
       ## push reported as failed. A ``pre-push`` hook sets one so that a
       ## remote that does not answer cannot hold the user's push hostage.
@@ -265,9 +271,14 @@ proc gitRun(
     env: openArray[(string, string)] = [],
     timeoutMs = 0,
 ): GitRun =
-  ## ``git.gitRun`` in the repository, with its git.
+  ## ``git.gitRun`` in the repository, with its git, within its deadline.
   gitRun(
-    r.dir, args, input = input, env = env, timeoutMs = timeoutMs, gitExe = r.gitExe
+    r.dir,
+    args,
+    input = input,
+    env = env,
+    timeoutMs = if timeoutMs > 0: timeoutMs else: r.deadline.remainingMs,
+    gitExe = r.gitExe,
   )
 
 proc git(
@@ -277,8 +288,30 @@ proc git(
     env: openArray[(string, string)] = [],
     timeoutMs = 0,
 ): GitStep =
-  ## ``git.git`` in the repository, with its git.
-  git(r.dir, args, input = input, env = env, timeoutMs = timeoutMs, gitExe = r.gitExe)
+  ## ``git.git`` in the repository, with its git, within its deadline.
+  git(
+    r.dir,
+    args,
+    input = input,
+    env = env,
+    timeoutMs = if timeoutMs > 0: timeoutMs else: r.deadline.remainingMs,
+    gitExe = r.gitExe,
+  )
+
+proc dropWorkRef(r: NotesRepo, name: string) =
+  ## Delete a private ref. Outside the deadline: this is the cleanup after a
+  ## command the deadline stopped, it reads no object, and it must not be
+  ## stopped itself.
+  discard
+    gitRun(r.dir, ["update-ref", "-d", name], env = [NoLazyFetch], gitExe = r.gitExe)
+
+proc localOnlyEnv(r: NotesRepo): seq[(string, string)] =
+  ## For the commands of a bounded publish that read only what the push being
+  ## decided already has: commits and their trees, never a note.
+  if r.deadline.limited:
+    @[NoLazyFetch]
+  else:
+    @[]
 
 proc isOid(r: NotesRepo, s: string): bool =
   s.len == r.hexLen and s.allCharsInSet({'0' .. '9', 'a' .. 'f'})
@@ -407,7 +440,7 @@ proc buildNotesCommit(
             "the work ref " & work & " lost the note on " & annotated & " while in use",
           )
   finally:
-    discard git(r, ["update-ref", "-d", work])
+    dropWorkRef(r, work)
   var args = @["commit-tree", tree]
   for p in parents:
     args.add ["-p", p]
@@ -459,7 +492,7 @@ proc isRange(rev: string): bool =
   ".." in rev or rev.endsWith("^!") or rev.endsWith("^@") or "^-" in rev
 
 proc resolveCommits*(
-    dir: string, revisions: openArray[string]
+    dir: string, revisions: openArray[string], env: openArray[(string, string)] = []
 ): tuple[ok: bool, commits: seq[string], problem: string] =
   ## The commits ``revisions`` name, in order, each once. A revision with
   ## ``..``, ``^!``, ``^@`` or ``^-`` is a range (``git rev-list``); any
@@ -471,13 +504,14 @@ proc resolveCommits*(
       return (false, @[], "`" & rev & "` is not a revision")
     var found: seq[string]
     if isRange(rev):
-      let listed = git(dir, ["rev-list", rev, "--"])
+      let listed = git(dir, ["rev-list", rev, "--"], env = env)
       if not listed.ok:
         return
           (false, @[], "`" & rev & "` is not a revision range here: " & listed.failure)
       found = listed.stdout.splitLines().filterIt(it.len > 0)
     else:
-      let one = git(dir, ["rev-parse", "--verify", "--quiet", rev & "^{commit}"])
+      let one =
+        git(dir, ["rev-parse", "--verify", "--quiet", rev & "^{commit}"], env = env)
       if not one.ok:
         return (false, @[], "`" & rev & "` does not name a commit here")
       found = @[singleLine(one.stdout)]
@@ -514,7 +548,7 @@ proc treesOfCommits(
       result.problems.add t.problem
       return
     own.add t.tree
-  let scoped = scopedTrees(r.dir, r.hexLen, own, declared.scopes)
+  let scoped = scopedTrees(r.dir, r.hexLen, own, declared.scopes, r.localOnlyEnv)
   if not scoped.ok:
     result.problems.add scoped.problem
     return
@@ -534,6 +568,7 @@ proc publishNotes*(
     revisions: openArray[string],
     notesRef = "",
     attempts = DefaultAttempts,
+    deadline = Deadline(),
 ): PublishReport =
   ## Tooling §3 ``notes publish``: for each commit, the store's certificates
   ## for each of its trees — ``<commit>^{tree}`` and its scoped tree in every
@@ -542,13 +577,19 @@ proc publishNotes*(
   ## form, by the §3.1 writer rule (``addRecord``). Publishing twice adds
   ## nothing; every piece already in a note is kept. An invalid scope
   ## declaration is reported and nothing is written.
-  let r = openNotesRepo(dir, notesRef)
+  ##
+  ## A note a partial clone lacks must be read to add to it, so a lazy fetch of
+  ## it is legitimate here. With a limited ``deadline`` (a ``pre-push`` hook's
+  ## budget, Tooling §4.3) that read, and every other command, stops when the
+  ## deadline passes, and the note is reported rather than overwritten.
+  var r = openNotesRepo(dir, notesRef)
   if not r.ok:
     result.problems.add r.problem
     return
+  r.deadline = deadline
   result.notesRef = r.notesRef
   collectStaleWorkRefs(r)
-  let resolved = resolveCommits(dir, revisions)
+  let resolved = resolveCommits(dir, revisions, r.localOnlyEnv)
   if not resolved.ok:
     result.problems.add resolved.problem
     return
@@ -820,7 +861,7 @@ proc fetchRemoteRef(
       )
     (true, true, value.oid, "")
   finally:
-    discard gitRun(r, ["update-ref", "-d", temporary])
+    dropWorkRef(r, temporary)
 
 proc mergeNotesCommits(
     r: NotesRepo, local, remote: string
@@ -1061,7 +1102,9 @@ proc classifyRejection(
     return (rjUnexplained, "", "")
   if now.oid == pushed:
     return (rjAlreadyThere, now.oid, "")
-  let have = gitRun(r, ["cat-file", "-e", now.oid & "^{commit}"])
+  # What THIS repository has, which is the question: a commit fetched for the
+  # sake of the answer would turn a lost race into an unexplained refusal.
+  let have = gitRun(r, ["cat-file", "-e", now.oid & "^{commit}"], env = [NoLazyFetch])
   if not have.started:
     return (rjUnknown, now.oid, have.failure)
   if have.exitCode != 0:
@@ -1088,7 +1131,7 @@ proc pushNotes*(
   ## server in another locale or with its own wording is handled alike. A
   ## refusal while the remote ref has not moved past what was pushed is tried
   ## once more and then reported as a failure.
-  let r = openNotesRepo(dir, notesRef, options.gitExe)
+  var r = openNotesRepo(dir, notesRef, options.gitExe)
   if not r.ok:
     result.problems.add r.problem
     return
@@ -1102,6 +1145,9 @@ proc pushNotes*(
   )
   let attempts = max(options.attempts, 1)
   let deadline = deadlineIn(options.timeoutMs)
+  # The merges between attempts read notes too, and in a partial clone that
+  # is a network operation (`integrate`).
+  r.deadline = deadline
   template outOfTime(): bool =
     if deadline.expired:
       result.problems.add "pushing " & r.notesRef & " to " & remote &

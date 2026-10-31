@@ -151,7 +151,8 @@ proc cleanStaleWorkRefs*(
     return
   var args = @["for-each-ref", "--format=%(refname)%00%(objectname)"]
   args.add prefixes
-  let listed = git(dir, args, gitExe = gitExe)
+  # Refs only: no object is needed, so none may be fetched for this.
+  let listed = git(dir, args, env = [NoLazyFetch], gitExe = gitExe)
   if not listed.ok:
     result.problems.add listed.failure
     return
@@ -167,7 +168,8 @@ proc cleanStaleWorkRefs*(
         leaf = name[p.len .. ^1]
     if leaf.len == 0 or not parseWorkRefName(leaf).isStale(now):
       continue
-    let deleted = gitRun(dir, ["update-ref", "-d", name, oid], gitExe = gitExe)
+    let deleted =
+      gitRun(dir, ["update-ref", "-d", name, oid], env = [NoLazyFetch], gitExe = gitExe)
     if deleted.started and deleted.exitCode == 0:
       result.removed.add name
     elif deleted.started:

@@ -385,8 +385,9 @@ push`, or `git push origin refs/notes/…`, runs the hook without it pushing
 - **Its own push runs no hook** (`git push --no-verify`), so it does not
   re-enter itself. The library call is `prePushHook`, which passes
   `PushOptions.runHooks = false` to `pushNotes`.
-- **Bounded time.** Its network operations — every push attempt, the fetches
-  and backoff between them — share a budget of 60 seconds;
+- **Bounded time.** Its network operations — every push attempt, the fetches,
+  merges and backoff between them, and reading a note a partial clone lacks —
+  share a budget of 60 seconds;
   `TEST_CERTIFICATES_HOOK_TIMEOUT` (whole seconds, at least 1) changes it.
   There is no unlimited setting
   ([Tooling §4.3](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Tooling.md#43-publishing-pushing-and-the-time-budget)):
@@ -398,6 +399,13 @@ push`, or `git push origin refs/notes/…`, runs the hook without it pushing
   a controlling terminal there, so an `ssh` that would ask for a passphrase on the
   terminal fails at once (use an agent) instead of waiting unseen for the
   budget to run out. Interrupting the push (Ctrl-C) stops them as well.
+- **Partial clones.** Deciding what a push introduces fetches nothing. A remote
+  object the clone lacks counts as unknown, so the remote-tracking refs stand in
+  for it, and with no certificates to carry the hook touches no remote. This
+  relies on `GIT_NO_LAZY_FETCH`. With a git that ignores it (2.38.5 does; 2.42.2
+  and 2.53.0 do not) a lookup can start a fetch, which the budget then stops. In a `tree:0` clone
+  with declared scopes, a tree the clone lacks is reported as a warning: fetch
+  that tree, or use `blob:none`, for scoped certificates to travel.
 - **Opting out of one push:** `TEST_CERTIFICATES_HOOK=off git push …` (also
   `0`, `false`, `no`). The hook says it skipped propagation. `git push
 --no-verify` skips every `pre-push` hook, this one included.
@@ -507,6 +515,7 @@ or `unreadable`.
 | A scoped certificate never reaches the receiving side                 | Its scope must be declared (`git config --get-regexp '^testcertificatesscope'`) on the pushing side to be published, and on the importing side to be imported. Each section is one scope: `src` and `lib` in one section is not the scope `src`.                                                                                                            |
 | `find` reports `unreadable`                                           | A permission problem, reported rather than read as "nothing found": fix the directory's permissions.                                                                                                                                                                                                                                                        |
 | The push takes as long as the time budget                             | The remote does not answer the notes push. Lower `TEST_CERTIFICATES_HOOK_TIMEOUT`, or opt out of the push with `TEST_CERTIFICATES_HOOK=off`.                                                                                                                                                                                                                |
+| `could not read trees for the declared scopes` in a partial clone     | The clone was made with a `tree:0` filter and lacks a tree the scope needs. The hook does not fetch to find out whether there is anything to carry. Use a `blob:none` clone, or fetch the trees first.                                                                                                                                                      |
 
 ## Environment
 

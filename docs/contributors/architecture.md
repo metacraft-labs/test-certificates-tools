@@ -253,6 +253,20 @@ already exited when the time ran out keeps its own answer. The hook's
 budget is always finite (Tooling §4.3): `prePushHook` replaces a non-positive
 one with `DefaultHookTimeoutMs`.
 
+Partial clones are where a command that looks local reaches the network: git
+fetches an absent object from the promisor remote, inside `rev-parse`,
+`cat-file`, `write-tree` or `notes add`, with no limit of its own. The hook has
+two classes of command, and every git it spawns is in one of them. While it
+decides what a push introduces and whether any of it is certified, it cannot
+fetch (`git.NoLazyFetch`, the `GIT_NO_LAZY_FETCH` variable, which reaches a child
+through the same environment on POSIX and on Windows): §4.3 allows no network
+operation with nothing to carry, and an absent remote object is the input §4.2
+names. Scoped trees use `write-tree --missing-ok`, because the plain form fetches
+every in-scope blob. Once there is something to carry, a note the clone lacks
+must be read rather than overwritten, so `NotesRepo.deadline` limits every
+command for that repository, and the one budget covers publish and push.
+Deleting a private ref afterwards is outside the deadline and cannot fetch.
+
 - **POSIX.** A timed child starts a session of its own (`setsid` between
   `fork` and `execve`), so its pid is the id of a process group holding it
   and every helper it starts that does not leave on purpose (a daemon calls

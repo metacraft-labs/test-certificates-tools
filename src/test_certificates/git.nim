@@ -729,6 +729,21 @@ const PathspecEnvironment* = [
   ("GIT_TERMINAL_PROMPT", "0"),
 ]
 
+const NoLazyFetch* = ("GIT_NO_LAZY_FETCH", "1")
+  ## For a command's ``env``: it answers from this repository's objects alone.
+  ## In a partial clone git otherwise fetches an absent object from the
+  ## promisor remote, inside commands that look purely local (``rev-parse``,
+  ## ``write-tree``), with no time limit of their own; a child process inherits
+  ## the variable.
+  ## See GIT_NO_LAZY_FETCH in https://git-scm.com/docs/git
+  ##
+  ## The variable rather than the ``--no-lazy-fetch`` option, because a git
+  ## that predates the feature ignores a variable but stops with "unknown
+  ## option" at an option, which would break every command here. Measured:
+  ## git 2.42.2, 2.44.2 and 2.53.0 honour the variable, 2.38.5 ignores it. Such
+  ## a git still lazy-fetches, so a caller with a time budget does not rely on
+  ## this alone (``hook.peeledCommit``).
+
 proc gitRun*(
     cwd: string,
     args: openArray[string],

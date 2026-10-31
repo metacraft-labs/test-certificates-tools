@@ -152,11 +152,17 @@ proc parseTree(
   result.ok = true
 
 proc scopedTrees*(
-    dir: string, hexLen: int, trees: openArray[string], scopes: openArray[DeclaredScope]
+    dir: string,
+    hexLen: int,
+    trees: openArray[string],
+    scopes: openArray[DeclaredScope],
+    env: openArray[(string, string)] = [],
 ): ScopedTrees =
   ## For each tree in ``trees``, its scoped tree in each of ``scopes``
   ## (Content-Id §4.1). ``hexLen`` is the length of an object id here. See
-  ## the module comment for how the work is shared between trees.
+  ## the module comment for how the work is shared between trees. ``env`` is
+  ## added to the environment of every command that reads objects: with
+  ## ``git.NoLazyFetch``, a tree a partial clone lacks is a reported failure.
   result.ok = true
   if scopes.len == 0 or trees.len == 0:
     for t in trees:
@@ -209,7 +215,7 @@ proc scopedTrees*(
     for item in pending:
       if item.at notin parsed and not asked.containsOrIncl(item.at):
         wanted.add item.at
-    let read = readObjects(toplevel, wanted, "tree")
+    let read = readObjects(toplevel, wanted, "tree", env)
     if not read.ok:
       return ScopedTrees(
         problem: "could not read trees for the declared scopes: " & read.problem
@@ -266,7 +272,8 @@ proc scopedTrees*(
         key.add '\0'
       if key notin byContent:
         inc n
-        let built = scopedTreeOf(toplevel, root, s.paths, scratch / ("index-" & $n))
+        let built =
+          scopedTreeOf(toplevel, root, s.paths, scratch / ("index-" & $n), env)
         if not built.ok:
           return ScopedTrees(
             problem:
