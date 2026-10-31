@@ -1299,6 +1299,34 @@ suite "hook pre-push, the git it runs":
       check report.problems.anyIt("time budget" in it)
       check noteKeys(remote).len == 0
 
+    test "what_the_deciding_stage_spent_is_not_given_back_to_the_publish":
+      # Deciding finishes in time, and spends most of the budget: a slow command
+      # that still answers. The publish then has what is left and no more, so a
+      # command that would have fitted a second budget is stopped.
+      let scratch = scratchDir()
+      defer:
+        cleanup(scratch)
+      let remote = newBareRemote(scratch)
+      let a = newClone(scratch, remote, "a")
+      let tree = commitFile(a, "f", "one\n")
+      let tip = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+      certify(a, tree)
+      var options = defaultHookOptions()
+      options.push.timeoutMs = 2000
+      options.push.gitExe = gitWrapper(
+        scratch / "slow-git",
+        findExe("git"),
+        "case \"$1 $2\" in \"rev-list --format=%T\") sleep 1.5;; notes*) sleep 1;; esac",
+      )
+      let report = prePushHook(
+        a.dir, "", remote, pushLine(tip, zeros()), StoreRoots(user: a.store), options
+      )
+      checkpoint report.problems.join("\n")
+      check not report.propagated
+      check not (report.publishRan and report.published.ok)
+      check not report.pushRan
+      check noteKeys(remote).len == 0
+
     test "a_git_that_ignores_the_variable_is_stopped_at_a_tree_it_lacks":
       # The tree read of a declared scope in a tree:0 clone: only the deadline
       # ends it, because this git makes the fetch the variable forbids.
