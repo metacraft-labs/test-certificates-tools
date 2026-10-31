@@ -1294,6 +1294,7 @@ suite "hook pre-push, the git it runs":
       checkpoint report.problems.join("\n")
       check took < WithinBudgetMs
       check not report.propagated
+      check not report.publishRan
       check not report.pushRan
       check report.problems.anyIt("time budget" in it)
       check noteKeys(remote).len == 0
