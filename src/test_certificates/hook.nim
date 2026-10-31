@@ -109,7 +109,8 @@ type
     push*: PushOptions
       ## For the notes push. ``runHooks`` is always forced off, and a
       ## ``timeoutMs`` that is not positive is replaced by
-      ## ``DefaultHookTimeoutMs``: the budget is always finite.
+      ## ``DefaultHookTimeoutMs``: the budget is always finite. ``gitExe`` is
+      ## the git of the whole hook, not only of its push.
     batchTrees*: int
       ## How many distinct introduced trees are held at once while their
       ## scoped trees are computed; 0 means ``DefaultHookBatchTrees``. It
@@ -174,29 +175,25 @@ proc parsePrePushInput*(text: string): PrePushInput =
       remoteOid: fields[3],
     )
 
-proc isConfiguredRemote(dir, name: string): bool =
+proc isConfiguredRemote(context: GitContext, dir, name: string): bool =
   if name.len == 0:
     return false
-  let listed = git(dir, ["remote"])
+  let listed = git(context, dir, ["remote"])
   listed.ok and name in listed.stdout.splitLines()
 
-proc peeledCommit(dir, oid: string, budget: Deadline): string =
+proc peeledCommit(context: GitContext, dir, oid: string): string =
   ## The commit ``oid`` is or peels to; "" when it is not one or is absent from
   ## this repository, which never fetches it. The time limit is for a git too
   ## old to know ``NoLazyFetch``: a lookup is otherwise instant, and one the
   ## limit stops is the answer "absent" (§4.2's table).
-  let run = gitRun(
-    dir,
-    ["rev-parse", "--verify", "--quiet", oid & "^{commit}"],
-    env = [NoLazyFetch],
-    timeoutMs = budget.remainingMs,
-  )
+  let run =
+    gitRun(context, dir, ["rev-parse", "--verify", "--quiet", oid & "^{commit}"])
   if run.started and run.exitCode == 0:
     singleLine(run.stdout)
   else:
     ""
 
-proc whyNotPeelable(dir, oid: string, budget: Deadline): string =
+proc whyNotPeelable(context: GitContext, dir, oid: string): string =
   ## ``oid`` did not peel to a commit: "" when that is because it is not one
   ## (§4.1 skips it), and otherwise why that cannot be told, because the object
   ## or what it tags is absent here. Skipping that entry silently could drop
@@ -205,16 +202,12 @@ proc whyNotPeelable(dir, oid: string, budget: Deadline): string =
   const MaxTagChain = 32
   var at = oid
   for _ in 1 .. MaxTagChain:
-    let kind = git(
-      dir, ["cat-file", "-t", at], env = [NoLazyFetch], timeoutMs = budget.remainingMs
-    )
+    let kind = git(context, dir, ["cat-file", "-t", at])
     if not kind.ok:
       return at & " is not in this repository"
     if singleLine(kind.stdout) != "tag":
       return ""
-    let tag = git(
-      dir, ["cat-file", "tag", at], env = [NoLazyFetch], timeoutMs = budget.remainingMs
-    )
+    let tag = git(context, dir, ["cat-file", "tag", at])
     if not tag.ok:
       return at & " cannot be read: " & tag.failure
     var target, targetType: string
@@ -263,6 +256,7 @@ type Selection = ref object
   ## (``prePushHook``). What it holds is bounded by the trees that have
   ## certificates and by one batch, never by the history.
   dir: string
+  context: GitContext ## How every command of the deciding stage runs.
   hexLen: int
   batchTrees: int
   scopes: seq[DeclaredScope]
@@ -296,7 +290,7 @@ proc flush(s: Selection): bool =
   var trees: seq[string]
   for tree in s.batch.keys:
     trees.add tree
-  let scoped = scopedTrees(s.dir, s.hexLen, trees, s.scopes, [NoLazyFetch])
+  let scoped = scopedTrees(s.dir, s.hexLen, trees, s.scopes, s.context)
   if not scoped.ok:
     s.problem = scoped.problem
     return false
@@ -353,10 +347,10 @@ proc listInto(
   let sink: OutputSink = proc(data: openArray[char]): bool =
     s.feed(data)
   let run = gitRun(
+    s.context,
     s.dir,
     @["rev-list", "--format=%T", "--stdin"] & @options,
     input = revisionLines(revisions),
-    env = [NoLazyFetch],
     onStdout = sink,
   )
   if s.problem.len > 0:
@@ -384,7 +378,10 @@ proc prePushHook*(
   result.faults = parsed.faults
   result.propagated = true
 
-  let repo = openNotesRepo(dir)
+  # One git throughout (`PushOptions.gitExe`): a caller that resolved its own
+  # does not get a mixture of it and whichever `git` is first on `PATH`.
+  let gitExe = options.push.gitExe
+  let repo = openNotesRepo(dir, gitExe = gitExe)
   if not repo.ok:
     result.problems.add repo.problem
     result.propagated = false
@@ -399,6 +396,7 @@ proc prePushHook*(
     if options.push.timeoutMs > 0: options.push.timeoutMs else: DefaultHookTimeoutMs
   # Only a git that ignores `NoLazyFetch` can spend any of this (`peeledCommit`).
   let lookups = deadlineIn(budgetMs)
+  let deciding = GitContext(gitExe: gitExe, env: @[NoLazyFetch], deadline: lookups)
 
   # Which refs count, and what the remote is known to have.
   var considered: seq[(PushedRef, string)] # The ref and its local commit.
@@ -408,7 +406,7 @@ proc prePushHook*(
     # two uses of the answer below cannot disagree.
   for r in parsed.refs:
     if not r.remoteOid.isZero and r.remoteOid notin remoteCommit:
-      let have = peeledCommit(dir, r.remoteOid, lookups)
+      let have = peeledCommit(deciding, dir, r.remoteOid)
       remoteCommit[r.remoteOid] = have
       if have.len > 0:
         onRemote.add have
@@ -419,9 +417,9 @@ proc prePushHook*(
     if r.localRef.startsWith(NotesRefPrefix) or r.remoteRef.startsWith(NotesRefPrefix):
       result.skipped.add r.remoteRef & ": a notes ref, pushed as it is"
       continue
-    let local = peeledCommit(dir, r.localOid, lookups)
+    let local = peeledCommit(deciding, dir, r.localOid)
     if local.len == 0:
-      let why = whyNotPeelable(dir, r.localOid, lookups)
+      let why = whyNotPeelable(deciding, dir, r.localOid)
       if why.len > 0:
         result.problems.add "what the push to " & r.remoteRef &
           " introduces cannot be told: " & why
@@ -436,7 +434,7 @@ proc prePushHook*(
   # `--remotes=<name>` is a glob over refs/remotes/; a name that would
   # read as a pattern is not used as one.
   let tracked =
-    if isConfiguredRemote(dir, remoteName) and
+    if isConfiguredRemote(deciding, dir, remoteName) and
         not remoteName.contains({'*', '?', '[', '\\'}):
       @["--not", "--remotes=" & remoteName]
     else:
@@ -459,10 +457,11 @@ proc prePushHook*(
   # What deciding needs, read once: the declared scopes (Tooling §3.1; an
   # invalid declaration stops propagation, reported, as `notes publish`
   # stops) and the content directories in the store.
-  let declared = declaredScopes(dir)
+  let declared = declaredScopes(dir, deciding)
   let stored = storedDigests(roots, repo.algorithm)
   let selection = Selection(
     dir: dir,
+    context: deciding,
     hexLen: repo.hexLen,
     batchTrees:
       if options.batchTrees > 0: options.batchTrees else: DefaultHookBatchTrees,
@@ -487,10 +486,10 @@ proc prePushHook*(
       # Only now is it known that there may be something to carry, so a
       # push with nothing to consider reports nothing about the setup.
       let anything = git(
+        deciding,
         dir,
         @["rev-list", "--max-count=1", "--stdin"] & listOptions,
         input = revisionLines(revisions),
-        env = [NoLazyFetch],
       )
       if anything.ok and anything.stdout.strip().len == 0:
         continue
@@ -536,7 +535,8 @@ proc prePushHook*(
   # this clone lacks) and the push alike.
   let budget = deadlineIn(budgetMs)
   result.publishRan = true
-  result.published = publishNotes(dir, roots, result.certified, deadline = budget)
+  result.published =
+    publishNotes(dir, roots, result.certified, deadline = budget, gitExe = gitExe)
   result.remarks.add result.published.remarks
   for t in result.published.trees:
     for p in t.searchProblems:

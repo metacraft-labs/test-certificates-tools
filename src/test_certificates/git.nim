@@ -52,6 +52,14 @@ type
     stdout*: string
     failure*: string ## A sentence naming the command and why it failed.
 
+  GitContext* = object
+    ## How every command of one operation runs, for code that spawns git on
+    ## behalf of an operation it does not own (``scopes``, ``content_state``).
+    ## The default value is the default git, nothing added, and no limit.
+    gitExe*: string ## As for ``gitRun``.
+    env*: seq[(string, string)] ## Added to each command's environment.
+    deadline*: Deadline ## No command outlives it.
+
 proc deadlineIn*(ms: int): Deadline =
   ## ``ms`` milliseconds from now; no limit when ``ms`` is 0 or less.
   if ms <= 0:
@@ -806,6 +814,33 @@ proc git*(
       failure: shown & " failed (exit " & $run.exitCode & "): " & run.stderr.strip()
     )
   GitStep(ok: true, stdout: run.stdout)
+
+proc gitRun*(
+    context: GitContext,
+    cwd: string,
+    args: openArray[string],
+    indexFile = "",
+    input = "",
+    onStdout: OutputSink = nil,
+): GitRun =
+  ## ``gitRun`` as ``context`` says.
+  gitRun(
+    cwd, args, indexFile, input, context.env, context.deadline.remainingMs, onStdout,
+    context.gitExe,
+  )
+
+proc git*(
+    context: GitContext,
+    cwd: string,
+    args: openArray[string],
+    indexFile = "",
+    input = "",
+): GitStep =
+  ## ``git`` as ``context`` says.
+  git(
+    cwd, args, indexFile, input, context.env, context.deadline.remainingMs,
+    context.gitExe,
+  )
 
 proc singleLine*(output: string): string =
   ## The one line a plumbing command printed, without its terminator only:

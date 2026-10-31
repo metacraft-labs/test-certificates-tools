@@ -223,10 +223,7 @@ proc detectUnmerged(
   (true, @[Refusal(condition: ncUnmerged, paths: paths)], "")
 
 proc readObjects*(
-    toplevel: string,
-    objectIds: openArray[string],
-    kind: string,
-    env: openArray[(string, string)] = [],
+    toplevel: string, objectIds: openArray[string], kind: string, context = GitContext()
 ): tuple[ok: bool, contents: seq[string], problem: string] =
   ## The raw content of each object, in order, each required to be of type
   ## ``kind`` (``blob``, ``tree``). One ``cat-file --batch`` for all of
@@ -235,7 +232,7 @@ proc readObjects*(
     return (true, @[], "")
   when defined(windows):
     for oid in objectIds:
-      let one = git(toplevel, ["cat-file", kind, oid], env = env)
+      let one = git(context, toplevel, ["cat-file", kind, oid])
       if not one.ok:
         return (false, @[], one.failure)
       result.contents.add one.stdout
@@ -244,7 +241,7 @@ proc readObjects*(
     # `cat-file --batch`: for each requested id, `<oid> SP <type> SP <size>
     # LF <content> LF` (git-cat-file(1), "BATCH OUTPUT").
     let batch = git(
-      toplevel, ["cat-file", "--batch"], input = @objectIds.join("\n") & "\n", env = env
+      context, toplevel, ["cat-file", "--batch"], input = @objectIds.join("\n") & "\n"
     )
     if not batch.ok:
       return (false, @[], batch.failure)
@@ -329,31 +326,30 @@ proc scopedTreeOf*(
     toplevel, tree: string,
     scope: openArray[string],
     indexFile: string,
-    env: openArray[(string, string)] = [],
+    context = GitContext(),
 ): tuple[ok: bool, tree, problem: string] =
   ## Content-Id §4.1, "Scoped": the tree holding the in-scope entries of
   ## ``tree`` at their FULL paths, selected with literal pathspecs, built in
   ## ``indexFile`` (a path that does not exist yet; it is left behind for
   ## the caller to remove with its directory). ``scope`` is not validated
-  ## here: callers check every path with ``scopePathProblem`` first. ``env``
-  ## is added to every command's environment.
-  let empty = git(toplevel, ["read-tree", "--empty"], indexFile, env = env)
+  ## here: callers check every path with ``scopePathProblem`` first.
+  let empty = git(context, toplevel, ["read-tree", "--empty"], indexFile)
   if not empty.ok:
     return (false, "", empty.failure)
   let listing = git(
+    context,
     toplevel,
     @["--literal-pathspecs", "ls-tree", "-r", "-z", "--full-tree", tree, "--"] & @scope,
-    env = env,
   )
   if not listing.ok:
     return (false, "", listing.failure)
   if listing.stdout.len > 0:
     let info = git(
+      context,
       toplevel,
       ["update-index", "-z", "--index-info"],
       indexFile,
       input = listing.stdout,
-      env = env,
     )
     if not info.ok:
       return (false, "", info.failure)
@@ -362,7 +358,7 @@ proc scopedTreeOf*(
   # `write-tree` fetch every in-scope blob the clone was made without. The
   # tree it writes depends only on the entries.
   # https://git-scm.com/docs/git-write-tree
-  let written = git(toplevel, ["write-tree", "--missing-ok"], indexFile, env = env)
+  let written = git(context, toplevel, ["write-tree", "--missing-ok"], indexFile)
   if not written.ok:
     return (false, "", written.failure)
   (true, singleLine(written.stdout), "")

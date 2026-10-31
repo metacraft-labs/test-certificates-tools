@@ -305,13 +305,18 @@ proc dropWorkRef(r: NotesRepo, name: string) =
   discard
     gitRun(r.dir, ["update-ref", "-d", name], env = [NoLazyFetch], gitExe = r.gitExe)
 
-proc localOnlyEnv(r: NotesRepo): seq[(string, string)] =
+proc localOnlyContext(r: NotesRepo): GitContext =
   ## For the commands of a bounded publish that read only what the push being
   ## decided already has: commits and their trees, never a note.
-  if r.deadline.limited:
-    @[NoLazyFetch]
-  else:
-    @[]
+  GitContext(
+    gitExe: r.gitExe,
+    env:
+      if r.deadline.limited:
+        @[NoLazyFetch]
+      else:
+        @[],
+    deadline: r.deadline,
+  )
 
 proc isOid(r: NotesRepo, s: string): bool =
   s.len == r.hexLen and s.allCharsInSet({'0' .. '9', 'a' .. 'f'})
@@ -492,7 +497,7 @@ proc isRange(rev: string): bool =
   ".." in rev or rev.endsWith("^!") or rev.endsWith("^@") or "^-" in rev
 
 proc resolveCommits*(
-    dir: string, revisions: openArray[string], env: openArray[(string, string)] = []
+    dir: string, revisions: openArray[string], context = GitContext()
 ): tuple[ok: bool, commits: seq[string], problem: string] =
   ## The commits ``revisions`` name, in order, each once. A revision with
   ## ``..``, ``^!``, ``^@`` or ``^-`` is a range (``git rev-list``); any
@@ -504,14 +509,14 @@ proc resolveCommits*(
       return (false, @[], "`" & rev & "` is not a revision")
     var found: seq[string]
     if isRange(rev):
-      let listed = git(dir, ["rev-list", rev, "--"], env = env)
+      let listed = git(context, dir, ["rev-list", rev, "--"])
       if not listed.ok:
         return
           (false, @[], "`" & rev & "` is not a revision range here: " & listed.failure)
       found = listed.stdout.splitLines().filterIt(it.len > 0)
     else:
       let one =
-        git(dir, ["rev-parse", "--verify", "--quiet", rev & "^{commit}"], env = env)
+        git(context, dir, ["rev-parse", "--verify", "--quiet", rev & "^{commit}"])
       if not one.ok:
         return (false, @[], "`" & rev & "` does not name a commit here")
       found = @[singleLine(one.stdout)]
@@ -536,7 +541,7 @@ proc treesOfCommits(
   ## tree in each scope the repository declares, commit by commit. A
   ## declaration that is invalid fails the whole call, before anything is
   ## written: publishing the rest would hide the error.
-  let declared = declaredScopes(r.dir)
+  let declared = declaredScopes(r.dir, r.localOnlyContext)
   if not declared.ok:
     for p in declared.problems:
       result.problems.add "invalid scope declaration: " & p
@@ -548,7 +553,7 @@ proc treesOfCommits(
       result.problems.add t.problem
       return
     own.add t.tree
-  let scoped = scopedTrees(r.dir, r.hexLen, own, declared.scopes, r.localOnlyEnv)
+  let scoped = scopedTrees(r.dir, r.hexLen, own, declared.scopes, r.localOnlyContext)
   if not scoped.ok:
     result.problems.add scoped.problem
     return
@@ -569,6 +574,7 @@ proc publishNotes*(
     notesRef = "",
     attempts = DefaultAttempts,
     deadline = Deadline(),
+    gitExe = DefaultGitExe,
 ): PublishReport =
   ## Tooling §3 ``notes publish``: for each commit, the store's certificates
   ## for each of its trees — ``<commit>^{tree}`` and its scoped tree in every
@@ -582,14 +588,15 @@ proc publishNotes*(
   ## it is legitimate here. With a limited ``deadline`` (a ``pre-push`` hook's
   ## budget, Tooling §4.3) that read, and every other command, stops when the
   ## deadline passes, and the note is reported rather than overwritten.
-  var r = openNotesRepo(dir, notesRef)
+  ## ``gitExe`` as for ``git.gitRun``.
+  var r = openNotesRepo(dir, notesRef, gitExe)
   if not r.ok:
     result.problems.add r.problem
     return
   r.deadline = deadline
   result.notesRef = r.notesRef
   collectStaleWorkRefs(r)
-  let resolved = resolveCommits(dir, revisions, r.localOnlyEnv)
+  let resolved = resolveCommits(dir, revisions, r.localOnlyContext)
   if not resolved.ok:
     result.problems.add resolved.problem
     return

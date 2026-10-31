@@ -63,13 +63,13 @@ proc scopeLabel*(paths: openArray[string]): string =
     quoted.add "\"" & p & "\""
   "[" & quoted.join(", ") & "]"
 
-proc declaredScopes*(dir: string): ScopeDeclaration =
+proc declaredScopes*(dir: string, context = GitContext()): ScopeDeclaration =
   ## The scopes the repository containing ``dir`` declares (Tooling §3.1).
   ## No declaration is a valid, empty one. A path that is not a scope path,
   ## a value-less ``path``, or any other key under the section makes the
   ## whole declaration invalid: every such problem is reported.
   let listed =
-    gitRun(dir, ["config", "-z", "--get-regexp", "^testcertificatesscope\\."])
+    gitRun(context, dir, ["config", "-z", "--get-regexp", "^testcertificatesscope\\."])
   if not listed.started:
     result.problems.add "could not read the declared scopes: " & listed.failure
     return
@@ -156,13 +156,13 @@ proc scopedTrees*(
     hexLen: int,
     trees: openArray[string],
     scopes: openArray[DeclaredScope],
-    env: openArray[(string, string)] = [],
+    context = GitContext(),
 ): ScopedTrees =
   ## For each tree in ``trees``, its scoped tree in each of ``scopes``
   ## (Content-Id §4.1). ``hexLen`` is the length of an object id here. See
-  ## the module comment for how the work is shared between trees. ``env`` is
-  ## added to the environment of every command that reads objects: with
-  ## ``git.NoLazyFetch``, a tree a partial clone lacks is a reported failure.
+  ## the module comment for how the work is shared between trees. Every command
+  ## runs as ``context`` says: with ``git.NoLazyFetch``, a tree a partial clone
+  ## lacks is a reported failure.
   result.ok = true
   if scopes.len == 0 or trees.len == 0:
     for t in trees:
@@ -172,12 +172,12 @@ proc scopedTrees*(
   # Every command runs at the top level (or, in a bare repository, in the
   # git directory), where `update-index` reads full paths as full paths.
   var toplevel = ""
-  let top = git(dir, ["rev-parse", "--show-toplevel"])
+  let top = git(context, dir, ["rev-parse", "--show-toplevel"])
   if top.ok:
     toplevel = singleLine(top.stdout)
   else:
-    let bare = git(dir, ["rev-parse", "--is-bare-repository"])
-    let gitDir = git(dir, ["rev-parse", "--absolute-git-dir"])
+    let bare = git(context, dir, ["rev-parse", "--is-bare-repository"])
+    let gitDir = git(context, dir, ["rev-parse", "--absolute-git-dir"])
     if not bare.ok or singleLine(bare.stdout) != "true" or not gitDir.ok:
       return ScopedTrees(
         problem: "`" & dir & "` is not inside a git repository: " & top.failure
@@ -215,7 +215,7 @@ proc scopedTrees*(
     for item in pending:
       if item.at notin parsed and not asked.containsOrIncl(item.at):
         wanted.add item.at
-    let read = readObjects(toplevel, wanted, "tree", env)
+    let read = readObjects(toplevel, wanted, "tree", context)
     if not read.ok:
       return ScopedTrees(
         problem: "could not read trees for the declared scopes: " & read.problem
@@ -273,7 +273,7 @@ proc scopedTrees*(
       if key notin byContent:
         inc n
         let built =
-          scopedTreeOf(toplevel, root, s.paths, scratch / ("index-" & $n), env)
+          scopedTreeOf(toplevel, root, s.paths, scratch / ("index-" & $n), context)
         if not built.ok:
           return ScopedTrees(
             problem:

@@ -696,6 +696,16 @@ proc pushLine(local, remoteOid: string): string =
 proc millisSince(start: MonoTime): int64 =
   (getMonoTime() - start).inMilliseconds
 
+proc gitWrapper(path, real, before: string): string =
+  ## An executable at ``path`` that runs the shell text ``before`` and then is
+  ## the real git. Justified, as the header of this file requires of a stand-in:
+  ## the real git does everything; the wrapper only makes observable or
+  ## provokable what cannot otherwise be (which git ran, a git that ignores a
+  ## variable, a stall at one chosen command).
+  writeFile(path, "#!/bin/sh\n" & before & "\nexec " & quoteShell(real) & " \"$@\"\n")
+  setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
+  path
+
 suite "hook pre-push, partial clones":
   test "a_remote_object_the_clone_lacks_makes_no_network_operation_with_a_stalled_promisor":
     # §4.3: nothing to carry, no network operation. The remote object is the
@@ -980,3 +990,78 @@ suite "hook pre-push, partial clones":
     checkpoint ofBlob.errors
     check ofBlob.exitCode == 0
     check "warning" notin ofBlob.errors
+
+suite "hook pre-push, the git it runs":
+  # A real git behind every wrapper, and real clones: the only thing a wrapper
+  # adds is what a real git cannot be made to do on demand (being another git,
+  # ignoring a variable, stalling at one chosen command). See `gitWrapper`.
+  setup:
+    let gitConfig = getTempDir() / ("t-hook-wrapper-config-" & $getCurrentProcessId())
+    writeFile(gitConfig, "[user]\n\tname = T\n\temail = t@example.invalid\n")
+    putEnv("GIT_CONFIG_GLOBAL", gitConfig)
+    putEnv("GIT_CONFIG_NOSYSTEM", "1")
+
+  teardown:
+    delEnv("GIT_CONFIG_GLOBAL")
+    delEnv("GIT_CONFIG_NOSYSTEM")
+    removeFile(gitConfig)
+
+  when not defined(windows):
+    test "the_git_a_caller_names_runs_every_command_of_the_hook":
+      # What a program embedding the library relies on (`PushOptions.gitExe`):
+      # the `git` first on PATH must never run, in the deciding stage or after
+      # it. Every stage is reached: a tag of a tree, a scope, a publish, a push.
+      let scratch = scratchDir()
+      defer:
+        cleanup(scratch)
+      let remote = newBareRemote(scratch)
+      let a = newClone(scratch, remote, "a")
+      createDir(a.dir / "src")
+      let tree = commitFile(a, "src/f", "one\n")
+      let tip = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+      discard gitIn(a.dir, ["config", "testCertificatesScope.s.path", "src"])
+      certify(a, tree)
+      let tagged = gitIn(
+          a.dir,
+          ["hash-object", "-t", "tag", "-w", "--stdin"],
+          input =
+            "object " & tree &
+            "\ntype tree\ntag t\ntagger T <t@example.invalid> 0 +0000\n\nm\n",
+        )
+        .strip()
+
+      let named = scratch / "named.log"
+      let wrongLog = scratch / "wrong.log"
+      let wrongDir = scratch / "wrong-bin"
+      createDir(wrongDir)
+      let real = findExe("git")
+      discard gitWrapper(wrongDir / "git", real, "printf '%s\\n' \"$*\" >> " & wrongLog)
+      var options = defaultHookOptions()
+      options.push.gitExe =
+        gitWrapper(scratch / "named-git", real, "printf '%s\\n' \"$*\" >> " & named)
+
+      let path = getEnv("PATH")
+      putEnv("PATH", wrongDir & $PathSep & path)
+      let report = prePushHook(
+        a.dir,
+        "",
+        remote,
+        "refs/heads/main " & tip & " refs/heads/main " & zeros() & "\n" & "refs/tags/t " &
+          tagged & " refs/tags/t " & zeros() & "\n",
+        StoreRoots(user: a.store),
+        options,
+      )
+      putEnv("PATH", path)
+      checkpoint report.problems.join("\n")
+      check report.propagated
+      check report.pushRan
+      check noteKeys(remote) == toHashSet([tree])
+      # The wrong git never ran, and the named one ran each stage's commands.
+      check not fileExists(wrongLog)
+      let calls = readFile(named).splitLines()
+      for command in [
+        "rev-parse --verify --quiet", "cat-file -t", "remote", "config -z",
+        "rev-list --format=%T", "cat-file --batch", "ls-tree -r", "notes --ref", "push ",
+      ]:
+        checkpoint command
+        check calls.anyIt(command in it)
