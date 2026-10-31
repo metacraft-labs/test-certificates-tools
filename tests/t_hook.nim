@@ -1065,3 +1065,112 @@ suite "hook pre-push, the git it runs":
       ]:
         checkpoint command
         check calls.anyIt(command in it)
+
+    proc ignoringLazyFetchVariable(scratch: string): HookOptions =
+      ## A git that behaves as one too old to know ``GIT_NO_LAZY_FETCH``
+      ## (measured: 2.38.5), whatever the git on this host is.
+      result = defaultHookOptions()
+      result.push.timeoutMs = 2000
+      result.push.gitExe =
+        gitWrapper(scratch / "old-git", findExe("git"), "unset GIT_NO_LAZY_FETCH")
+
+    proc stalled(c: Clone) =
+      discard gitIn(c.dir, ["config", "protocol.ext.allow", "always"])
+      discard
+        gitIn(c.dir, ["remote", "set-url", "origin", "ext::sleep " & $StallSeconds])
+
+    test "a_git_that_ignores_the_variable_is_stopped_at_a_remote_object_it_lacks":
+      # The lookup makes the lazy fetch, and only the deadline ends it. That
+      # spends the budget, so the hook says so, and the push goes on.
+      let scratch = scratchDir()
+      defer:
+        cleanup(scratch)
+      let (remote, seed) = seedRemote(scratch)
+      let p = newPartialClone(scratch, remote, "partial", "blob:none")
+      let main = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+      discard commitFile(seed, "g", "moved on\n")
+      check push(seed, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+      let moved = gitIn(seed.dir, ["rev-parse", "HEAD"]).strip()
+      let mine = commitOn(p, newTree(p, "m", "mine\n"), main)
+      stalled(p)
+      let started = getMonoTime()
+      let report = prePushHook(
+        p.dir,
+        "origin",
+        "origin",
+        pushLine(mine, moved),
+        StoreRoots(user: p.store),
+        ignoringLazyFetchVariable(scratch),
+      )
+      let took = millisSince(started)
+      checkpoint report.problems.join("\n")
+      check took < WithinBudgetMs
+      check not report.pushRan
+      check report.problems.anyIt("time budget" in it)
+
+    test "the_budget_is_one_when_the_deciding_stage_consumes_it":
+      # The lookup above used to have a budget of its own: the certificates then
+      # went on and were published and pushed under a second one, twice what
+      # the user was told. The push goes to an answering URL, so only the
+      # budget can stop it.
+      let scratch = scratchDir()
+      defer:
+        cleanup(scratch)
+      let (remote, seed) = seedRemote(scratch)
+      let p = newPartialClone(scratch, remote, "partial", "blob:none")
+      let main = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+      discard commitFile(seed, "g", "moved on\n")
+      check push(seed, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+      let moved = gitIn(seed.dir, ["rev-parse", "HEAD"]).strip()
+      let tree = newTree(p, "m", "mine\n")
+      let mine = commitOn(p, tree, main)
+      certify(p, tree)
+      stalled(p)
+      let started = getMonoTime()
+      let report = prePushHook(
+        p.dir,
+        "",
+        remote,
+        pushLine(mine, moved),
+        StoreRoots(user: p.store),
+        ignoringLazyFetchVariable(scratch),
+      )
+      let took = millisSince(started)
+      checkpoint report.problems.join("\n")
+      check took < WithinBudgetMs
+      check not report.propagated
+      check not report.pushRan
+      check report.problems.anyIt("time budget" in it)
+      check noteKeys(remote).len == 0
+
+    test "a_git_that_ignores_the_variable_is_stopped_at_a_tree_it_lacks":
+      # The tree read of a declared scope in a tree:0 clone: only the deadline
+      # ends it, because this git makes the fetch the variable forbids.
+      let scratch = scratchDir()
+      defer:
+        cleanup(scratch)
+      let (remote, seed) = seedRemote(scratch)
+      let p = newPartialClone(scratch, remote, "partial", "tree:0")
+      discard commitFile(seed, "g", "moved on\n")
+      check push(seed, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+      discard gitIn(p.dir, ["fetch", "-q", "origin"])
+      let fetched = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+      let tree = gitIn(p.dir, ["log", "-1", "--format=%T", fetched]).strip()
+      check isAbsent(p, tree)
+      discard gitIn(p.dir, ["config", "testCertificatesScope.s.path", "src"])
+      certify(p, repeat('a', 40)) # The store holds something, not for this tree.
+      stalled(p)
+      let started = getMonoTime()
+      let report = prePushHook(
+        p.dir,
+        "",
+        remote,
+        pushLine(fetched, zeros()),
+        StoreRoots(user: p.store),
+        ignoringLazyFetchVariable(scratch),
+      )
+      let took = millisSince(started)
+      checkpoint report.problems.join("\n")
+      check took < WithinBudgetMs
+      check not report.propagated
+      check not report.pushRan

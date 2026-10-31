@@ -62,7 +62,9 @@
 ## command with ``git.NoLazyFetch``: with nothing to carry there is no network
 ## operation at all, and a remote object the clone lacks is simply absent, as
 ## §4.2 expects. Only once there are certificates to carry may a lazy fetch run,
-## to read a note the clone lacks, and then inside the same budget as the push.
+## to read a note the clone lacks. A git too old to know the variable can fetch
+## in any of these commands, so every command of the hook, deciding included,
+## runs under one deadline.
 ##
 ## **Never failing.** ``prePushHook`` returns a report; nothing in it is a
 ## reason to refuse the push. ``propagated`` false with ``problems`` says
@@ -183,9 +185,9 @@ proc isConfiguredRemote(context: GitContext, dir, name: string): bool =
 
 proc peeledCommit(context: GitContext, dir, oid: string): string =
   ## The commit ``oid`` is or peels to; "" when it is not one or is absent from
-  ## this repository, which never fetches it. The time limit is for a git too
-  ## old to know ``NoLazyFetch``: a lookup is otherwise instant, and one the
-  ## limit stops is the answer "absent" (§4.2's table).
+  ## this repository, which never fetches it. ``context`` has the deadline for a
+  ## git too old to know ``NoLazyFetch``: a lookup is otherwise instant, and one
+  ## the deadline stops is the answer "absent" (§4.2's table).
   let run =
     gitRun(context, dir, ["rev-parse", "--verify", "--quiet", oid & "^{commit}"])
   if run.started and run.exitCode == 0:
@@ -202,6 +204,8 @@ proc whyNotPeelable(context: GitContext, dir, oid: string): string =
   const MaxTagChain = 32
   var at = oid
   for _ in 1 .. MaxTagChain:
+    if context.deadline.expired:
+      return "the time budget ran out before " & at & " could be examined"
     let kind = git(context, dir, ["cat-file", "-t", at])
     if not kind.ok:
       return at & " is not in this repository"
@@ -394,9 +398,15 @@ proc prePushHook*(
 
   let budgetMs =
     if options.push.timeoutMs > 0: options.push.timeoutMs else: DefaultHookTimeoutMs
-  # Only a git that ignores `NoLazyFetch` can spend any of this (`peeledCommit`).
-  let lookups = deadlineIn(budgetMs)
-  let deciding = GitContext(gitExe: gitExe, env: @[NoLazyFetch], deadline: lookups)
+  # One budget for the whole hook, deciding included, so that what the user
+  # waits for is what the documentation says. Starting a second one for the
+  # publish and the push would allow twice the budget whenever a git that ignores
+  # `NoLazyFetch` had spent the first on a promisor that does not answer. The
+  # price is a walk of a very long history (a push to a URL considers all of
+  # it) that outlasts the budget: reported like any other expiry, and the push
+  # goes on.
+  let budget = deadlineIn(budgetMs)
+  let deciding = GitContext(gitExe: gitExe, env: @[NoLazyFetch], deadline: budget)
 
   # Which refs count, and what the remote is known to have.
   var considered: seq[(PushedRef, string)] # The ref and its local commit.
@@ -519,6 +529,8 @@ proc prePushHook*(
       result.problems.add "the commits pushed to " & r.remoteRef &
         " could not be listed: " & listed.problem
       result.propagated = false
+      if budget.expired:
+        break
       continue
   if not selection.flush():
     result.introducedCount = selection.count
@@ -530,10 +542,16 @@ proc prePushHook*(
   if result.certified.len == 0:
     return
 
-  # From here there is something to carry, and the network may be used: the
-  # budget starts now and covers the publish (which may have to fetch a note
+  # From here there is something to carry, and the network may be used: what
+  # is left of the budget covers the publish (which may have to fetch a note
   # this clone lacks) and the push alike.
-  let budget = deadlineIn(budgetMs)
+  template stopWhenOutOfTime(what: string) =
+    if budget.expired:
+      result.problems.add what & ": the time budget of " & $budgetMs & " ms ran out"
+      result.propagated = false
+      return
+
+  stopWhenOutOfTime("the notes were not published")
   result.publishRan = true
   result.published =
     publishNotes(dir, roots, result.certified, deadline = budget, gitExe = gitExe)
@@ -548,11 +566,7 @@ proc prePushHook*(
     result.propagated = false
     # The certificates already in the local notes ref may still be pushed.
 
-  if budget.expired:
-    result.problems.add "the notes were not pushed: the time budget of " & $budgetMs &
-      " ms ran out"
-    result.propagated = false
-    return
+  stopWhenOutOfTime("the notes were not pushed")
   var pushOptions = options.push
   pushOptions.runHooks = false
   pushOptions.timeoutMs = budget.remainingMs

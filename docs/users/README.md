@@ -385,9 +385,9 @@ push`, or `git push origin refs/notes/…`, runs the hook without it pushing
 - **Its own push runs no hook** (`git push --no-verify`), so it does not
   re-enter itself. The library call is `prePushHook`, which passes
   `PushOptions.runHooks = false` to `pushNotes`.
-- **Bounded time.** Its network operations — every push attempt, the fetches,
-  merges and backoff between them, and reading a note a partial clone lacks —
-  share a budget of 60 seconds;
+- **Bounded time.** Everything it does — working out what the push introduces,
+  every push attempt, the fetches, merges and backoff between them, and reading
+  a note a partial clone lacks — shares a budget of 60 seconds;
   `TEST_CERTIFICATES_HOOK_TIMEOUT` (whole seconds, at least 1) changes it.
   There is no unlimited setting
   ([Tooling §4.3](https://github.com/metacraft-labs/test-certificates-spec/blob/latest/Tooling.md#43-publishing-pushing-and-the-time-budget)):

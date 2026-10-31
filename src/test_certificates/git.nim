@@ -750,7 +750,7 @@ const NoLazyFetch* = ("GIT_NO_LAZY_FETCH", "1")
   ## option" at an option, which would break every command here. Measured:
   ## git 2.42.2, 2.44.2 and 2.53.0 honour the variable, 2.38.5 ignores it. Such
   ## a git still lazy-fetches, so a caller with a time budget does not rely on
-  ## this alone (``hook.peeledCommit``).
+  ## this alone (``GitContext.deadline``).
 
 proc gitRun*(
     cwd: string,

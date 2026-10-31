@@ -263,8 +263,11 @@ through the same environment on POSIX and on Windows): §4.3 allows no network
 operation with nothing to carry, and an absent remote object is the input §4.2
 names. Scoped trees use `write-tree --missing-ok`, because the plain form fetches
 every in-scope blob. Once there is something to carry, a note the clone lacks
-must be read rather than overwritten, so `NotesRepo.deadline` limits every
-command for that repository, and the one budget covers publish and push.
+must be read rather than overwritten. A git that ignores the variable can fetch
+in any of these commands, so one deadline, started when the hook starts, limits
+all of them (`GitContext.deadline`, `NotesRepo.deadline`). It costs a walk of a
+very long history that outlasts the budget, which is reported like any other
+expiry.
 Deleting a private ref afterwards is outside the deadline and cannot fetch.
 
 - **POSIX.** A timed child starts a session of its own (`setsid` between
