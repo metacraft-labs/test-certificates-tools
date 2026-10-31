@@ -209,8 +209,15 @@ proc whyNotPeelable(context: GitContext, dir, oid: string): string =
     let kind = git(context, dir, ["cat-file", "-t", at])
     if not kind.ok:
       return at & " is not in this repository"
-    if singleLine(kind.stdout) != "tag":
+    case singleLine(kind.stdout)
+    of "tag":
+      discard
+    of "tree", "blob":
       return ""
+    else:
+      # It is a commit, so the lookup that failed did not fail for the reason
+      # §4.1 skips an entry for, and skipping it would drop what it introduces.
+      return at & " is a commit that could not be looked up"
     let tag = git(context, dir, ["cat-file", "tag", at])
     if not tag.ok:
       return at & " cannot be read: " & tag.failure

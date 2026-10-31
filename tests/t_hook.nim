@@ -1066,6 +1066,31 @@ suite "hook pre-push, the git it runs":
         checkpoint command
         check calls.anyIt(command in it)
 
+    test "a_commit_whose_lookup_failed_is_reported_and_not_skipped_as_no_commit":
+      # §4.1 skips what is not a commit. A commit whose lookup failed for any
+      # other reason (a lookup stopped by the deadline, while the next command
+      # got through) must not read as one, or its history would be dropped.
+      let scratch = scratchDir()
+      defer:
+        cleanup(scratch)
+      let remote = newBareRemote(scratch)
+      let a = newClone(scratch, remote, "a")
+      let tree = commitFile(a, "f", "one\n")
+      let tip = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+      certify(a, tree)
+      var options = defaultHookOptions()
+      options.push.gitExe = gitWrapper(
+        scratch / "failing-git",
+        findExe("git"),
+        "case \"$*\" in *\"^{commit}\"*) exit 1;; esac",
+      )
+      let report = prePushHook(
+        a.dir, "", remote, pushLine(tip, zeros()), StoreRoots(user: a.store), options
+      )
+      check report.skipped.len == 0
+      check not report.propagated
+      check report.problems.anyIt("cannot be told" in it)
+
     proc ignoringLazyFetchVariable(scratch: string): HookOptions =
       ## A git that behaves as one too old to know ``GIT_NO_LAZY_FETCH``
       ## (measured: 2.38.5), whatever the git on this host is.
