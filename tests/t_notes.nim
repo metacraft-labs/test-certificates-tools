@@ -20,6 +20,8 @@
 ##   union merge of note blobs on its own.
 ## * notes push and fetch run the git their caller names (``PushOptions.gitExe``,
 ##   ``fetchNotes(gitExe = …)``), not whatever ``git`` is first on ``PATH``.
+## * a publish that loses the local compare-and-swap starts over from what the
+##   other writer landed, and says so when the attempts run out.
 ## * work refs a crashed run left behind are removed, live ones kept — refs
 ##   named for an old run, a process that is gone, one still running, another
 ##   host, this process and a name the tool does not make.
@@ -805,6 +807,98 @@ suite "notes":
       checkpoint fetched.problems.join("\n")
       check fetched.ok
       check readFile(log).splitLines().anyIt(it.startsWith("fetch "))
+  when not defined(windows):
+    # The wrapper is a shell script, which Windows cannot run as an executable.
+    test "a publish that loses the local compare-and-swap starts over":
+      # Another writer in the same clone (Tooling §3: ``update-ref <ref> <new>
+      # <old>``) moves the notes ref between this publish's read of the note and
+      # its swap. A real git behind a wrapper places the other writer exactly
+      # there on the first swap, so the race is not left to the scheduler.
+      #
+      # The winner holds a signed copy of the payload the store holds unsigned,
+      # plus a record of its own. Writing from the stale snapshot would lose
+      # both; the retry has to re-read and apply the writer rule to what is
+      # there now, so the signed copy stands and the store's other record joins.
+      let scratch = scratchDir()
+      defer:
+        cleanup(scratch)
+      let remote = newBareRemote(scratch)
+      let a = newClone(scratch, remote, "a")
+      writeFile(a.dir / "f", "x\n")
+      commitAll(a.dir)
+      let tree = treeOf(a.dir, "HEAD")
+      let content = "git-tree-sha1:" & tree
+      let signed = reallySigned(
+        certificateText(content, targets = @["t-shared"], signed = true), scratch
+      )
+      let unsigned = signed.split("\n[certificate.signature]")[0] & "\n"
+      let winners = certificateText(content, targets = @["t-winner"])
+      let stores = certificateText(content, targets = @["t-store"])
+      putIn(a, unsigned)
+      putIn(a, stores)
+      # Prepare what the other writer will land, then take it off the ref.
+      writeNote(a.dir, tree, framed(record(signed), record(winners)))
+      let prepared = gitIn(a.dir, ["rev-parse", Ref]).strip()
+      discard gitIn(a.dir, ["update-ref", "-d", Ref])
+
+      var saved: seq[(string, string, bool)]
+      for (k, v) in a.env:
+        saved.add (k, getEnv(k), existsEnv(k))
+        putEnv(k, v)
+      defer:
+        for (k, v, existed) in saved:
+          if existed:
+            putEnv(k, v)
+          else:
+            delEnv(k)
+      let realGit = findExe("git")
+      if realGit.len == 0:
+        fatal "git is not on PATH"
+      # ``-m`` picks the swap out of the work-ref updates of building a commit.
+      let marker = scratch / "raced"
+      let once = scratch / "git-loses-once"
+      writeFile(
+        once,
+        "#!/bin/sh\nif [ \"$1\" = update-ref ] && [ \"$2\" = -m ] && [ ! -e " &
+          quoteShell(marker) & " ]; then\n  : > " & quoteShell(marker) & "\n  " &
+          quoteShell(realGit) & " update-ref " & Ref & " " & prepared & "\nfi\nexec " &
+          quoteShell(realGit) & " \"$@\"\n",
+      )
+      setFilePermissions(once, {fpUserRead, fpUserWrite, fpUserExec})
+      let raced = publishNotes(a.dir, nativeRoots(), ["HEAD"], gitExe = once)
+      checkpoint raced.problems.join("\n")
+      check raced.ok
+      check fileExists(marker) # The other writer really ran.
+      check gitIn(a.dir, ["rev-parse", Ref & "^"]).strip() == prepared
+      let note = noteBlob(a.dir, tree)
+      check note == framed(record(signed), record(winners), record(stores))
+      # Publishing again finds everything present and moves nothing.
+      let tip = gitIn(a.dir, ["rev-parse", Ref]).strip()
+      check publishNotes(a.dir, nativeRoots(), ["HEAD"]).ok
+      check gitIn(a.dir, ["rev-parse", Ref]).strip() == tip
+
+      # A writer that always wins: the attempts run out, publish says so, and
+      # what that writer landed is still the ref's value.
+      let always = scratch / "git-always-loses"
+      writeFile(
+        always,
+        "#!/bin/sh\nif [ \"$1\" = update-ref ] && [ \"$2\" = -m ]; then\n  moved=$(" &
+          quoteShell(realGit) &
+          " -c user.name=other -c user.email=other@example.invalid commit-tree -m \"other writer $$\" -p " &
+          Ref & " " & Ref & "^{tree}) && " & quoteShell(realGit) & " update-ref " & Ref &
+          " \"$moved\" && " & "printf '%s\\n' \"$moved\" > " &
+          quoteShell(scratch / "last-move") & "\nfi\nexec " & quoteShell(realGit) &
+          " \"$@\"\n",
+      )
+      setFilePermissions(always, {fpUserRead, fpUserWrite, fpUserExec})
+      putIn(a, certificateText(content, targets = @["t-later"]))
+      let exhausted =
+        publishNotes(a.dir, nativeRoots(), ["HEAD"], attempts = 3, gitExe = always)
+      checkpoint exhausted.problems.join("\n")
+      check not exhausted.ok
+      check exhausted.problems.anyIt("kept moving under concurrent writers" in it)
+      check gitIn(a.dir, ["rev-parse", Ref]).strip() ==
+        readFile(scratch / "last-move").strip()
 
 suite "note blobs":
   let base = certificateText("git-tree-sha1:" & repeat('a', 40), targets = @["t-1"])
