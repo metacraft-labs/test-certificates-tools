@@ -262,7 +262,9 @@ fetch (`git.NoLazyFetch`, the `GIT_NO_LAZY_FETCH` variable, which reaches a chil
 through the same environment on POSIX and on Windows): §4.3 allows no network
 operation with nothing to carry, and an absent remote object is the input §4.2
 names. Scoped trees use `write-tree --missing-ok`, because the plain form fetches
-every in-scope blob. Once there is something to carry, a note the clone lacks
+every in-scope blob. A tree the clone lacks stops the scoped trees alone: each
+commit's own tree still decides, and the reason is reported, because Tooling
+§4.3 allows no fetch to find out whether a scope is certified. Once there is something to carry, a note the clone lacks
 must be read rather than overwritten. A git that ignores the variable can fetch
 in any of these commands, so one deadline, started when the hook starts, limits
 all of them (`GitContext.deadline`, `NotesRepo.deadline`). It costs a walk of a

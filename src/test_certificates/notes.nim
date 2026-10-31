@@ -305,18 +305,9 @@ proc dropWorkRef(r: NotesRepo, name: string) =
   discard
     gitRun(r.dir, ["update-ref", "-d", name], env = [NoLazyFetch], gitExe = r.gitExe)
 
-proc localOnlyContext(r: NotesRepo): GitContext =
-  ## For the commands of a bounded publish that read only what the push being
-  ## decided already has: commits and their trees, never a note.
-  GitContext(
-    gitExe: r.gitExe,
-    env:
-      if r.deadline.limited:
-        @[NoLazyFetch]
-      else:
-        @[],
-    deadline: r.deadline,
-  )
+proc context(r: NotesRepo): GitContext =
+  ## For code outside this module that runs git for this repository.
+  GitContext(gitExe: r.gitExe, deadline: r.deadline)
 
 proc isOid(r: NotesRepo, s: string): bool =
   s.len == r.hexLen and s.allCharsInSet({'0' .. '9', 'a' .. 'f'})
@@ -541,7 +532,7 @@ proc treesOfCommits(
   ## tree in each scope the repository declares, commit by commit. A
   ## declaration that is invalid fails the whole call, before anything is
   ## written: publishing the rest would hide the error.
-  let declared = declaredScopes(r.dir, r.localOnlyContext)
+  let declared = declaredScopes(r.dir, r.context)
   if not declared.ok:
     for p in declared.problems:
       result.problems.add "invalid scope declaration: " & p
@@ -553,7 +544,7 @@ proc treesOfCommits(
       result.problems.add t.problem
       return
     own.add t.tree
-  let scoped = scopedTrees(r.dir, r.hexLen, own, declared.scopes, r.localOnlyContext)
+  let scoped = scopedTrees(r.dir, r.hexLen, own, declared.scopes, r.context)
   if not scoped.ok:
     result.problems.add scoped.problem
     return
@@ -584,10 +575,11 @@ proc publishNotes*(
   ## nothing; every piece already in a note is kept. An invalid scope
   ## declaration is reported and nothing is written.
   ##
-  ## A note a partial clone lacks must be read to add to it, so a lazy fetch of
-  ## it is legitimate here. With a limited ``deadline`` (a ``pre-push`` hook's
+  ## A note a partial clone lacks must be read to add to it, and so must the
+  ## trees of a declared scope to find its note, so a lazy fetch of either is
+  ## legitimate here. With a limited ``deadline`` (a ``pre-push`` hook's
   ## budget, Tooling §4.3) that read, and every other command, stops when the
-  ## deadline passes, and the note is reported rather than overwritten.
+  ## deadline passes, and what it was reading is reported; no note is overwritten.
   ## ``gitExe`` as for ``git.gitRun``.
   var r = openNotesRepo(dir, notesRef, gitExe)
   if not r.ok:
@@ -596,7 +588,7 @@ proc publishNotes*(
   r.deadline = deadline
   result.notesRef = r.notesRef
   collectStaleWorkRefs(r)
-  let resolved = resolveCommits(dir, revisions, r.localOnlyContext)
+  let resolved = resolveCommits(dir, revisions, r.context)
   if not resolved.ok:
     result.problems.add resolved.problem
     return

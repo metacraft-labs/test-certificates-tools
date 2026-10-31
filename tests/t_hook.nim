@@ -846,14 +846,104 @@ suite "hook pre-push, partial clones":
     check isAbsent(p, tree)
     discard gitIn(p.dir, ["config", "testCertificatesScope.s.path", "src"])
     let stall = stallPromisor(p)
+
+    # With an empty store no scoped tree can be certified: nothing is read,
+    # and there is nothing to warn about.
+    let empty = hookDirect(p, pushLine(fetched, zeros()), [remote, remote], stall)
+    checkpoint empty.errors
+    check empty.exitCode == 0
+    check "warning" notin empty.errors
+    check isAbsent(p, tree)
+
+    # With something stored, what a scope selects cannot be told without a
+    # fetch, and the report says what to do about it.
+    certify(p, repeat('a', 40))
     let started = getMonoTime()
     let run = hookDirect(p, pushLine(fetched, zeros()), [remote, remote], stall)
     let took = millisSince(started)
     checkpoint run.errors
     check run.exitCode == 0
     check "could not read trees for the declared scopes" in run.errors
+    check "notes publish" in run.errors
     check took < WithinBudgetMs
     check isAbsent(p, tree)
+
+  proc treeZeroClone(
+      scratch: string
+  ): tuple[remote: string, seed, p: Clone, commit, tree: string] =
+    ## A ``tree:0`` clone with a declared scope, lacking the tree of the commit
+    ## it is about to push.
+    let (remote, seed) = seedRemote(scratch)
+    let p = newPartialClone(scratch, remote, "partial", "tree:0")
+    discard commitFile(seed, "g", "moved on\n")
+    check push(seed, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+    discard gitIn(p.dir, ["fetch", "-q", "origin"])
+    let commit = gitIn(p.dir, ["rev-parse", "origin/main"]).strip()
+    let tree = gitIn(p.dir, ["log", "-1", "--format=%T", commit]).strip()
+    doAssert isAbsent(p, tree)
+    discard gitIn(p.dir, ["config", "testCertificatesScope.s.path", "src"])
+    (remote, seed, p, commit, tree)
+
+  test "a_tree_zero_clone_still_carries_the_certificate_of_a_commits_own_tree":
+    # The unscoped note is what a gateway reads. Not telling a scope must not
+    # cost it: and with that to carry a fetch is allowed, so the scoped tree of
+    # the same commit is found and published as well.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (_, seed, p, commit, tree) = treeZeroClone(scratch)
+    let scope = DeclaredScope(names: @["s"], paths: @["src"])
+    let scoped = scopedTrees(seed.dir, 40, [tree], [scope]).trees[tree][0]
+    certify(p, tree)
+    certify(p, scoped, "t-scoped")
+    let target = scratch / "target.git"
+    discard gitIn(scratch, ["init", "-q", "--bare", target])
+    let run = hookDirect(p, pushLine(commit, zeros()), [target, target])
+    checkpoint run.errors
+    check run.exitCode == 0
+    check "could not read trees for the declared scopes" in run.errors
+    check noteKeys(target) == toHashSet([tree, scoped])
+
+  test "a_tree_zero_clone_stops_at_the_budget_reading_trees_for_what_it_carries":
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (_, _, p, commit, tree) = treeZeroClone(scratch)
+    certify(p, tree)
+    let target = scratch / "target.git"
+    discard gitIn(scratch, ["init", "-q", "--bare", target])
+    let stall = stallPromisor(p)
+    let started = getMonoTime()
+    let run = hookDirect(p, pushLine(commit, zeros()), [target, target], stall)
+    let took = millisSince(started)
+    checkpoint run.errors
+    check run.exitCode == 0
+    check "certificates were NOT fully propagated" in run.errors
+    check took < WithinBudgetMs
+    check noteKeys(target).len == 0
+
+  test "the_remedy_the_warning_names_carries_a_certificate_for_a_scope":
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let (_, seed, p, commit, tree) = treeZeroClone(scratch)
+    let scope = DeclaredScope(names: @["s"], paths: @["src"])
+    let scoped = scopedTrees(seed.dir, 40, [tree], [scope]).trees[tree][0]
+    certify(p, scoped, "t-scoped")
+    let target = scratch / "target.git"
+    discard gitIn(scratch, ["init", "-q", "--bare", target])
+    let run = hookDirect(p, pushLine(commit, zeros()), [target, target])
+    checkpoint run.errors
+    check run.exitCode == 0
+    check "notes publish" in run.errors
+    check noteKeys(target).len == 0
+    let published = tc(p, ["notes", "publish", commit])
+    checkpoint published.errors
+    check published.exitCode == 0
+    let pushed = tc(p, ["notes", "push", target])
+    checkpoint pushed.errors
+    check pushed.exitCode == 0
+    check noteKeys(target) == toHashSet([scoped])
 
   proc withAbsentNote(
       scratch: string, certifyTree = true

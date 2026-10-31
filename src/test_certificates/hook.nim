@@ -62,7 +62,7 @@
 ## command with ``git.NoLazyFetch``: with nothing to carry there is no network
 ## operation at all, and a remote object the clone lacks is simply absent, as
 ## §4.2 expects. Only once there are certificates to carry may a lazy fetch run,
-## to read a note the clone lacks. A git too old to know the variable can fetch
+## to read a note the clone lacks or the trees of a declared scope. A git too old to know the variable can fetch
 ## in any of these commands, so every command of the hook, deciding included,
 ## runs under one deadline.
 ##
@@ -277,6 +277,9 @@ type Selection = ref object
   certified: seq[string]
   count: int ## Introduced commits seen.
   problem: string ## Why selection stopped; "" while it goes on.
+  scopesProblem: string
+    ## Why scoped trees could not be computed; selection then goes on with each
+    ## commit's own tree alone.
   partial: string ## An output line not yet complete.
   commit: string ## The commit whose tree line comes next.
 
@@ -303,8 +306,17 @@ proc flush(s: Selection): bool =
     trees.add tree
   let scoped = scopedTrees(s.dir, s.hexLen, trees, s.scopes, s.context)
   if not scoped.ok:
-    s.problem = scoped.problem
-    return false
+    if s.context.deadline.expired:
+      s.problem = scoped.problem
+      return false
+    # Whether a commit's own tree is certified can be told without its scoped
+    # trees, so its certificates still travel.
+    s.scopesProblem = scoped.problem
+    s.scopes = @[]
+    for tree, commit in s.batch:
+      s.choose(tree, commit, [])
+    s.batch.clear()
+    return true
   for tree, commit in s.batch:
     s.choose(tree, commit, scoped.trees[tree])
   s.batch.clear()
@@ -482,7 +494,13 @@ proc prePushHook*(
     hexLen: repo.hexLen,
     batchTrees:
       if options.batchTrees > 0: options.batchTrees else: DefaultHookBatchTrees,
-    scopes: declared.scopes,
+    # With an empty store no tree of any scope can have certificates, so there
+    # is nothing to compute, and nothing to read that a partial clone may lack.
+    scopes:
+      if stored.digests.len > 0:
+        declared.scopes
+      else:
+        @[],
     stored: stored.digests,
   )
   var prepared = false
@@ -527,7 +545,7 @@ proc prePushHook*(
         return
     let listed = selection.listInto(revisions, listOptions)
     if not listed.ok and selection.problem.len > 0:
-      # Computing scoped trees failed: as before, propagation stops.
+      # The budget ran out computing scoped trees.
       result.introducedCount = selection.count
       result.problems.add selection.problem
       result.propagated = false
@@ -546,6 +564,13 @@ proc prePushHook*(
     return
   result.introducedCount = selection.count
   result.certified = selection.certified
+  if selection.scopesProblem.len > 0:
+    # Tooling §4.3: telling whether a scoped tree is certified would take a
+    # fetch, and the hook makes none with nothing known to carry. So certificates
+    # for a declared scope may stay behind, and that is reported, with what to do.
+    result.problems.add selection.scopesProblem &
+      ". A certificate for a declared scope may not have travelled: `test-certificates notes publish <commit>` and then `notes push` may fetch what is missing, and a clone made with `--filter=blob:none` needs no fetch."
+    result.propagated = false
   if result.certified.len == 0:
     return
 

@@ -572,9 +572,15 @@ proc prePushCommand(io: CliIo, args: seq[string]): int =
   if report.problems.len > 0:
     for p in report.problems:
       hookSay io, "warning: " & p
+    # Only notes that were published can be pushed by a retry of the push.
+    let retry =
+      if report.publishRan and report.published.ok:
+        ""
+      else:
+        "`test-certificates notes publish <commit>` and then "
     hookSay io,
       "warning: certificates were NOT fully propagated; the push continues. " &
-        "Retry with `test-certificates notes push " & report.target & "`."
+        "Retry with " & retry & "`test-certificates notes push " & report.target & "`."
 
 proc hookCommand(io: CliIo, args: seq[string]): int =
   if args.len == 0:
