@@ -1358,3 +1358,80 @@ suite "hook pre-push, the git it runs":
       check took < WithinBudgetMs
       check not report.propagated
       check not report.pushRan
+
+suite "introducedCommits":
+  test "introduced_commits_is_the_set_the_hook_publishes_for":
+    # The hook's own count is the control: every row of §4.2's table a caller can
+    # ask about, answered by the export, against what the hook then considers.
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    let a = newClone(scratch, remote, "a")
+    discard commitFile(a, "f", "one\n")
+    check push(a, "-q", "origin", "HEAD:refs/heads/main").exitCode == 0
+    let published = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+    discard commitFile(a, "f", "two\n")
+    let middle = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+    discard commitFile(a, "f", "three\n")
+    let tip = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+    let unknown = repeat('7', 40)
+
+    proc asks(input: string, name = "origin"): seq[string] =
+      let answer = introducedCommits(a.dir, name, input)
+      checkpoint answer.problems.join("; ")
+      check answer.ok
+      answer.commits
+
+    proc hookCount(input: string, name = "origin"): int =
+      # Run in-process with an empty store: it decides, and carries nothing.
+      prePushHook(a.dir, name, name, input, nativeRoots()).introducedCount
+
+    let cases = [
+      # An existing branch: <remote object>..L, newest first.
+      (pushLine(tip, published), "origin", @[tip, middle]),
+      # A new branch: what no remote-tracking ref reaches.
+      (pushLine(tip, zeros()), "origin", @[tip, middle]),
+      # A remote object this clone never fetched: the same.
+      (pushLine(tip, unknown), "origin", @[tip, middle]),
+      # A new branch at what a remote-tracking ref reaches: nothing.
+      (pushLine(published, zeros()), "origin", newSeq[string]()),
+      # A URL has no remote-tracking refs: the whole history.
+      (pushLine(tip, zeros()), remote, @[tip, middle, published]),
+      # Another entry's remote object is on the remote too.
+      (
+        pushLine(tip, zeros()) & "refs/heads/y " & middle & " refs/heads/y " & middle &
+          "\n",
+        remote,
+        @[tip],
+      ),
+    ]
+    for (input, name, expected) in cases:
+      checkpoint input
+      check asks(input, name) == expected
+      check hookCount(input, name) == expected.len
+
+    # Left alone, as the hook leaves them.
+    check asks("(delete) " & zeros() & " refs/heads/x " & tip & "\n").len == 0
+    check asks("refs/notes/x " & tip & " refs/notes/x " & zeros() & "\n").len == 0
+
+  test "introduced_commits_reports_what_it_cannot_tell":
+    let scratch = scratchDir()
+    defer:
+      cleanup(scratch)
+    let remote = newBareRemote(scratch)
+    let a = newClone(scratch, remote, "a")
+    discard commitFile(a, "f", "one\n")
+    let tip = gitIn(a.dir, ["rev-parse", "HEAD"]).strip()
+
+    # An input line that cannot be read is not "introduces nothing".
+    let garbled = introducedCommits(a.dir, "origin", "garbage\n")
+    check not garbled.ok
+    check garbled.problems.len == 1
+
+    # Nor is a repository that cannot be asked, and it does not raise.
+    let elsewhere = introducedCommits(
+      scratch / "no-such-repository", "origin", pushLine(tip, zeros())
+    )
+    check not elsewhere.ok
+    check elsewhere.commits.len == 0

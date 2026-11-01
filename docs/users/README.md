@@ -453,6 +453,9 @@ Library: `prePushHook(dir, remoteName, remoteUrl, input, roots, options):
 HookReport` (`introducedCount` is how many commits the push introduces;
 `certified` lists those whose certificates were carried), `parsePrePushInput(text)`, `installPrePushHook(dir)`,
 `PrePushHookScript`.
+`introducedCommits(dir, remoteName, input, options): IntroducedCommits` answers
+which commits such a push introduces (Tooling §4.2), for a caller that has to
+decide something about them before pushing.
 
 ## Carrying certificates with every push
 

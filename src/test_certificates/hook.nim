@@ -240,6 +240,88 @@ proc whyNotPeelable(context: GitContext, dir, oid: string): string =
       return "the tag " & at & " cannot be parsed"
   "its chain of tags is longer than " & $MaxTagChain
 
+type
+  IntroducedRange = object ## One pushed ref's commits, as ``rev-list`` arguments.
+    pushed: PushedRef
+    revisions: seq[string] ## For ``--stdin``: the local commit and exclusions.
+    options: seq[string] ## The remote-tracking refs, when they bound this ref.
+
+  IntroducedPlan = object
+    ranges: seq[IntroducedRange]
+    skipped: seq[string]
+    problems: seq[string]
+
+proc planIntroduced(
+    context: GitContext, dir, remoteName: string, parsed: PrePushInput
+): IntroducedPlan =
+  ## Tooling §4.2 as ``rev-list`` arguments: what each entry of a push introduces,
+  ## and what is left alone. The one place that says so, for ``prePushHook``, which
+  ## streams the commits, and ``introducedCommits``, which returns them.
+  # Which refs count, and what the remote is known to have.
+  var considered: seq[(PushedRef, string)] # The ref and its local commit.
+  var onRemote: seq[string] # Remote objects this repository has.
+  var remoteCommit = initTable[string, string]()
+    # Each remote object's commit, "" when absent: looked up once, so that the
+    # two uses of the answer below cannot disagree.
+  for r in parsed.refs:
+    if not r.remoteOid.isZero and r.remoteOid notin remoteCommit:
+      let have = peeledCommit(context, dir, r.remoteOid)
+      remoteCommit[r.remoteOid] = have
+      if have.len > 0:
+        onRemote.add have
+  for r in parsed.refs:
+    if r.localOid.isZero:
+      result.skipped.add r.remoteRef & ": a deletion"
+      continue
+    if r.localRef.startsWith(NotesRefPrefix) or r.remoteRef.startsWith(NotesRefPrefix):
+      result.skipped.add r.remoteRef & ": a notes ref, pushed as it is"
+      continue
+    let local = peeledCommit(context, dir, r.localOid)
+    if local.len == 0:
+      let why = whyNotPeelable(context, dir, r.localOid)
+      if why.len > 0:
+        result.problems.add "what the push to " & r.remoteRef &
+          " introduces cannot be told: " & why
+      else:
+        result.skipped.add r.remoteRef & ": " & r.localOid & " is not a commit"
+      continue
+    considered.add (r, local)
+  if considered.len == 0:
+    return
+
+  # `--remotes=<name>` is a glob over refs/remotes/; a name that would
+  # read as a pattern is not used as one.
+  let tracked =
+    if isConfiguredRemote(context, dir, remoteName) and
+        not remoteName.contains({'*', '?', '[', '\\'}):
+      @["--not", "--remotes=" & remoteName]
+    else:
+      @[]
+  # The refs whose remote object this repository lacks are bounded by the
+  # remote-tracking refs as well. They come after the others, so that each
+  # ref can exclude every earlier ref's commits outright (an earlier ref's
+  # exclusions are then always a subset of its own) and no commit is listed
+  # twice — without remembering the commits already seen, which for a push
+  # to a URL would be the whole history.
+  var earlier: seq[string]
+  for wantTracked in [false, true]:
+    for (r, local) in considered:
+      let remoteHas = remoteCommit.getOrDefault(r.remoteOid)
+      let usesTracked = remoteHas.len == 0 and tracked.len > 0
+      if usesTracked != wantTracked:
+        continue
+      # `onRemote` holds this ref's own remote object when this repository
+      # has it, so the range is then `<remote>..<local>`.
+      var span = IntroducedRange(pushed: r, revisions: @[local])
+      for o in onRemote:
+        span.revisions.add "^" & o
+      for e in earlier:
+        span.revisions.add "^" & e
+      if usesTracked:
+        span.options = tracked
+      result.ranges.add span
+      earlier.add local
+
 proc storedDigests(
     roots: StoreRoots, algorithm: ContentAlgorithm
 ): tuple[digests: HashSet[string], problems: seq[string]] =
@@ -386,6 +468,48 @@ proc listInto(
     )
   (true, "")
 
+type IntroducedCommits* = object ## ``introducedCommits``'s answer.
+  ok*: bool ## False: at least one entry could not be told; see ``problems``.
+  commits*: seq[string]
+    ## The commits the push introduces (Tooling §4.2), each once, as ``rev-list``
+    ## orders them within an entry: newest first.
+  problems*: seq[string]
+
+proc introducedCommits*(
+    dir, remoteName, input: string, options = defaultHookOptions()
+): IntroducedCommits =
+  ## The commits a push with this ``pre-push`` input would introduce (Tooling §4.2):
+  ## what ``prePushHook`` considers, for a caller that has to decide something
+  ## about them before the push. ``remoteName`` is the hook's first argument.
+  ## Reads this repository only: like the hook, it runs under ``git.NoLazyFetch``
+  ## and within ``options.push.timeoutMs`` (``DefaultHookTimeoutMs`` when that is
+  ## not positive), so an entry that does not finish is reported, not waited for.
+  ## Unlike ``prePushHook`` this holds the commits in memory, and a push to a URL
+  ## considers a ref's whole history.
+  let budgetMs =
+    if options.push.timeoutMs > 0: options.push.timeoutMs else: DefaultHookTimeoutMs
+  let context = GitContext(
+    gitExe: options.push.gitExe, env: @[NoLazyFetch], deadline: deadlineIn(budgetMs)
+  )
+  let parsed = parsePrePushInput(input)
+  let plan = planIntroduced(context, dir, remoteName, parsed)
+  result.problems = parsed.faults & plan.problems
+  for span in plan.ranges:
+    let listed = git(
+      context,
+      dir,
+      @["rev-list", "--stdin"] & span.options,
+      input = revisionLines(span.revisions),
+    )
+    if not listed.ok:
+      result.problems.add "the commits pushed to " & span.pushed.remoteRef &
+        " could not be listed: " & listed.failure
+      continue
+    for line in listed.stdout.splitLines():
+      if line.len > 0:
+        result.commits.add line
+  result.ok = result.problems.len == 0
+
 proc prePushHook*(
     dir, remoteName, remoteUrl, input: string,
     roots: StoreRoots,
@@ -427,61 +551,13 @@ proc prePushHook*(
   let budget = deadlineIn(budgetMs)
   let deciding = GitContext(gitExe: gitExe, env: @[NoLazyFetch], deadline: budget)
 
-  # Which refs count, and what the remote is known to have.
-  var considered: seq[(PushedRef, string)] # The ref and its local commit.
-  var onRemote: seq[string] # Remote objects this repository has.
-  var remoteCommit = initTable[string, string]()
-    # Each remote object's commit, "" when absent: looked up once, so that the
-    # two uses of the answer below cannot disagree.
-  for r in parsed.refs:
-    if not r.remoteOid.isZero and r.remoteOid notin remoteCommit:
-      let have = peeledCommit(deciding, dir, r.remoteOid)
-      remoteCommit[r.remoteOid] = have
-      if have.len > 0:
-        onRemote.add have
-  for r in parsed.refs:
-    if r.localOid.isZero:
-      result.skipped.add r.remoteRef & ": a deletion"
-      continue
-    if r.localRef.startsWith(NotesRefPrefix) or r.remoteRef.startsWith(NotesRefPrefix):
-      result.skipped.add r.remoteRef & ": a notes ref, pushed as it is"
-      continue
-    let local = peeledCommit(deciding, dir, r.localOid)
-    if local.len == 0:
-      let why = whyNotPeelable(deciding, dir, r.localOid)
-      if why.len > 0:
-        result.problems.add "what the push to " & r.remoteRef &
-          " introduces cannot be told: " & why
-        result.propagated = false
-      else:
-        result.skipped.add r.remoteRef & ": " & r.localOid & " is not a commit"
-      continue
-    considered.add (r, local)
-  if considered.len == 0:
+  let plan = planIntroduced(deciding, dir, remoteName, parsed)
+  result.skipped.add plan.skipped
+  if plan.problems.len > 0:
+    result.problems.add plan.problems
+    result.propagated = false
+  if plan.ranges.len == 0:
     return
-
-  # `--remotes=<name>` is a glob over refs/remotes/; a name that would
-  # read as a pattern is not used as one.
-  let tracked =
-    if isConfiguredRemote(deciding, dir, remoteName) and
-        not remoteName.contains({'*', '?', '[', '\\'}):
-      @["--not", "--remotes=" & remoteName]
-    else:
-      @[]
-  # The refs whose remote object this repository lacks are bounded by the
-  # remote-tracking refs as well. They come after the others, so that each
-  # ref can exclude every earlier ref's commits outright (an earlier ref's
-  # exclusions are then always a subset of its own) and no commit is listed
-  # twice — without remembering the commits already seen, which for a push
-  # to a URL would be the whole history.
-  var ordered: seq[(PushedRef, string, bool)]
-    # The ref, its commit, bounded by tracking refs.
-  for wantTracked in [false, true]:
-    for (r, local) in considered:
-      let remoteHas = remoteCommit.getOrDefault(r.remoteOid)
-      let usesTracked = remoteHas.len == 0 and tracked.len > 0
-      if usesTracked == wantTracked:
-        ordered.add (r, local, usesTracked)
 
   # What deciding needs, read once: the declared scopes (Tooling §3.1; an
   # invalid declaration stops propagation, reported, as `notes publish`
@@ -504,19 +580,10 @@ proc prePushHook*(
     stored: stored.digests,
   )
   var prepared = false
-  for i, (r, local, usesTracked) in ordered:
-    # `onRemote` holds this ref's own remote object when this repository
-    # has it, so the range is then `<remote>..<local>`.
-    var revisions = @[local]
-    for o in onRemote:
-      revisions.add "^" & o
-    for j in 0 ..< i:
-      revisions.add "^" & ordered[j][1]
-    let listOptions =
-      if usesTracked:
-        tracked
-      else:
-        @[]
+  for span in plan.ranges:
+    let revisions = span.revisions
+    let listOptions = span.options
+    let r = span.pushed
     if not prepared:
       # Only now is it known that there may be something to carry, so a
       # push with nothing to consider reports nothing about the setup.
