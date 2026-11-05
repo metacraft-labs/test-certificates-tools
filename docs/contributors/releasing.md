@@ -8,11 +8,15 @@ releases nothing.
 
 ## The version
 
-`test_certificates.nimble` holds the one version. The flake's package and
-`test-certificates --version` read it at build time, and the release tooling
-reads it from there too (`versionFile` in
-[`.github/release.json`](../../.github/release.json)). Change it with
-`just bump-version <x.y.z>`. The release refuses a tag that differs from
+`test_certificates.nimble` holds the version. The flake's package reads it
+at evaluation time, and the release tooling reads it from there too
+(`versionFile` in [`.github/release.json`](../../.github/release.json)).
+`src/test_certificates/version.nim` carries the same value into the code, for
+`test-certificates --version`: the code reads nothing outside `src/`, so the
+sources compile from a source archive, a vendored copy or a nimble install,
+none of which has the nimble file where a checkout has it. Change the version
+with `just bump-version <x.y.z>`, which writes both; `tests/t_version.nim`
+fails when they differ. The release refuses a tag that differs from
 `v<version>` and a version that is not three numbers.
 
 ## What the release workflow does

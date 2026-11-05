@@ -79,8 +79,13 @@ clean:
 alias t := test
 alias fmt := format
 
-# Set the package version (the nimble file is the single source of truth;
-# the flake and `test-certificates --version` read it): `just bump-version 0.2.0`.
+# Set the package version: `just bump-version 0.2.0`. The nimble file holds
+# the version the flake and the release tooling read; `version.nim` carries the
+# same value into the code (`test-certificates --version`), inside `src/`, so
+# the sources compile without the nimble file beside them. Both are written
+# here, and `tests/t_version.nim` refuses a mismatch.
 bump-version new:
     sed -i.bak -E 's/^version = "[^"]*"/version = "{{ new }}"/' test_certificates.nimble && rm test_certificates.nimble.bak
+    sed -i.bak -E 's/^const Version\* = "[^"]*"/const Version* = "{{ new }}"/' src/test_certificates/version.nim && rm src/test_certificates/version.nim.bak
     grep -n '^version' test_certificates.nimble
+    grep -n '^const Version' src/test_certificates/version.nim

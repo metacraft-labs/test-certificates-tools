@@ -25,8 +25,9 @@
       perSystem =
         { pkgs, config, ... }:
         let
-          # Single-sourced from the nimble file: this package has exactly one
-          # version, and a second copy of it is a thing that can drift.
+          # Read from the nimble file, as the release tooling reads it. The
+          # code's copy (src/test_certificates/version.nim) is checked against
+          # it by tests/t_version.nim, so the two cannot drift unnoticed.
           nimbleVersionLines = builtins.filter (line: builtins.match "version[[:space:]]*=.*" line != null) (
             pkgs.lib.splitString "\n" (builtins.readFile ./test_certificates.nimble)
           );

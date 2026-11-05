@@ -24,18 +24,11 @@
 ##   reported on standard error.
 
 import std/[os, sequtils, strutils]
-import ./[roots, put, find, prune, content_state, notes, hook, scopes]
+import ./[roots, put, find, prune, content_state, notes, hook, scopes, version]
 
-const
-  Version* = block:
-    ## Single-sourced from the nimble file, read at compile time.
-    var v = ""
-    for line in staticRead("../../test_certificates.nimble").splitLines:
-      if line.startsWith("version") and '"' in line:
-        v = line.split('"')[1]
-    doAssert v.len > 0, "no version in test_certificates.nimble"
-    v
-  Usage* = """
+export Version
+
+const Usage* = """
 Usage:
   test-certificates store-root
   test-certificates put [--system <user>] <file>...|-
