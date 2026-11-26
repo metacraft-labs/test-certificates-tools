@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           # The nix flavor refuses an empty token. Every flake input of this
@@ -118,7 +118,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           # The nix flavor refuses an empty token. Every flake input of this
@@ -217,7 +217,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           # The nix flavor refuses an empty token. Every flake input of this
